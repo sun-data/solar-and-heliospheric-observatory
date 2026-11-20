@@ -20,6 +20,7 @@ dependencies = [
     "urllib3>=2",
     "joblib",
     "numpy",
+    "scipy",
     "matplotlib",
     "astropy",
     "named-arrays~=2.20",

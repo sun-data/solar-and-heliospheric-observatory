@@ -322,6 +322,62 @@ class TestSpectrographObservation:
         assert isinstance(ax, matplotlib.axes.Axes)
         plt.close("all")
 
+    def test_remove_bad_steps(self, path_test: pathlib.Path):
+        result = soho.sumer.SpectrographObservation.from_level1(
+            path=path_test,
+            wavelength=_wavelength,
+            order=2,
+        )
+        radiance = result._radiance_aligned()
+        radiance[30] = 10 * radiance[30]
+        repaired = result._with_radiance(radiance).remove_bad_steps()
+        expected = (radiance[29] + radiance[31]) / 2
+        assert np.allclose(repaired._radiance_aligned()[30], expected, equal_nan=True)
+        assert np.allclose(
+            repaired._radiance_aligned()[10],
+            radiance[10],
+            equal_nan=True,
+        )
+
+    def test_trim_slit(self, path_test: pathlib.Path):
+        result = soho.sumer.SpectrographObservation.from_level1(
+            path=path_test,
+            wavelength=_wavelength,
+            order=2,
+        )
+        axis = result.axis_detector_y
+        lit = result.trim_slit()
+        num_row = lit.outputs.shape[axis]
+        assert 0 < num_row < result.outputs.shape[axis]
+
+        radiance = lit._radiance_aligned()
+        radiance[:, :3] = 0
+        trimmed = lit._with_radiance(radiance).trim_slit()
+        assert trimmed.outputs.shape[axis] == num_row - 3
+        assert trimmed.inputs.position.y.shape[axis] == num_row - 3 + 1
+
+    def test_remove_stripes(self, path_test: pathlib.Path):
+        result = soho.sumer.SpectrographObservation.from_level1(
+            path=path_test,
+            wavelength=_wavelength,
+            order=2,
+        )
+        radiance = result._radiance_aligned()
+        num_row = radiance.shape[1]
+        stripes = 1 + 0.2 * (np.arange(num_row) % 2 - 0.5)
+        striped = result._with_radiance(radiance * stripes[np.newaxis, :, np.newaxis])
+        removed = striped.remove_stripes(num_min=5)._radiance_aligned()
+
+        def contrast(cube: np.ndarray) -> float:
+            """How much alternate rows of the slit differ, on average."""
+            rows = np.nanmedian(np.nansum(cube, axis=~0), axis=0)
+            rows = rows[rows > 0]
+            return float(np.nanmedian(np.abs(np.diff(rows)) / rows[1:]))
+
+        assert contrast(removed) < contrast(
+            striped.remove_stripes(gain_max=1, gain_min=1)._radiance_aligned()
+        )
+
     def test_show_still(self, path_test: pathlib.Path):
         result = soho.sumer.SpectrographObservation.from_level1(
             path=path_test,

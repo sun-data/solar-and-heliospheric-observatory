@@ -8,6 +8,7 @@ import tarfile
 import warnings
 import dataclasses
 import numpy as np
+import scipy.ndimage
 import matplotlib.axes
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
@@ -933,6 +934,156 @@ class SpectrographObservation(
             axis_detector_x=axis_detector_x,
             axis_detector_y=axis_detector_y,
         )
+
+    def _radiance_aligned(self) -> np.ndarray:
+        """
+        The radiances as a plain array, along the exposures, the slit, and
+        wavelength, in the unit of the level-1 files.
+        """
+        axes = (self.axis_detector_x, self.axis_detector_y, self.axis_wavelength)
+        outputs = typing.cast(na.ScalarArray, self.outputs)
+        aligned = typing.cast(u.Quantity, outputs.ndarray_aligned(axes))
+        return np.asarray(aligned.to_value(_unit_radiance), dtype=float)
+
+    def _with_radiance(self, radiance: np.ndarray) -> "SpectrographObservation":
+        """
+        A copy with new radiances, given as by :meth:`_radiance_aligned`.
+
+        Parameters
+        ----------
+        radiance
+            The radiances, along the exposures, the slit, and wavelength.
+        """
+        axes = (self.axis_detector_x, self.axis_detector_y, self.axis_wavelength)
+        outputs = na.ScalarArray(radiance << _unit_radiance, axes=axes)
+        return dataclasses.replace(self, outputs=outputs)
+
+    def remove_bad_steps(
+        self,
+        ratio_max: float = 2,
+        ratio_min: float = 0.3,
+        width: int = 9,
+    ) -> "SpectrographObservation":
+        """
+        Replace each bad raster step by the mean of the nearest good steps on
+        either side.
+
+        A step is bad if the total radiance of its exposure is more than
+        `ratio_max` times, or less than `ratio_min` times, the median of the
+        `width` exposures around it,
+        as when the detector loses part of an exposure.
+
+        Parameters
+        ----------
+        ratio_max
+            The largest ratio of a good step to the median around it.
+        ratio_min
+            The smallest ratio of a good step to the median around it.
+        width
+            The number of exposures the median is taken over.
+        """
+        radiance = self._radiance_aligned()
+        with warnings.catch_warnings():
+            # exposures with no data have no total
+            warnings.simplefilter("ignore", RuntimeWarning)
+            total = np.nansum(radiance, axis=(1, 2))
+            half = width // 2
+            reference = np.array(
+                [
+                    np.median(total[max(i - half, 0) : i + half + 1])
+                    for i in range(len(total))
+                ]
+            )
+        bad = (total > ratio_max * reference) | (total < ratio_min * reference)
+        good = np.flatnonzero(~bad)
+        repaired = radiance.copy()
+        for i in np.flatnonzero(bad):
+            near = good[good < i][-1:].tolist() + good[good > i][:1].tolist()
+            if near:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    repaired[i] = np.nanmean(radiance[near], axis=0)
+        return self._with_radiance(repaired)
+
+    def trim_slit(self, fraction: float = 0.05) -> "SpectrographObservation":
+        """
+        Leave out the rows of the detector beyond the ends of the slit,
+        keeping the longest run of rows whose total radiance is more than
+        `fraction` of the median of the rows which have any.
+
+        Parameters
+        ----------
+        fraction
+            The least total radiance of a row which is kept,
+            relative to the median of the rows.
+        """
+        radiance = self._radiance_aligned()
+        total = np.nansum(radiance, axis=(0, 2))
+        positive = total[total > 0]
+        if not positive.size:
+            return self
+        lit = total > fraction * np.median(positive)
+        best = (0, 0)
+        start = None
+        for i, value in enumerate(np.append(lit, False)):
+            if value and start is None:
+                start = i
+            elif not value and start is not None:
+                if i - start > best[1] - best[0]:
+                    best = (start, i)
+                start = None
+        trimmed = self[{self.axis_detector_y: slice(*best)}]
+        return typing.cast("SpectrographObservation", trimmed)
+
+    def remove_stripes(
+        self,
+        fraction_sun: float = 0.3,
+        num_min: int = 20,
+        size: int = 15,
+        gain_min: float = 0.7,
+        gain_max: float = 1.3,
+    ) -> "SpectrographObservation":
+        """
+        Divide each row of the slit by its gain,
+        which removes the stripes fixed to the position along the slit
+        that some rasters have, such as the scans of the polar coronal holes.
+
+        The gain of a row is the median radiance of the Sun in that row,
+        over the exposures, relative to a running median of it along the
+        slit.
+        A pixel is on the Sun if its radiance is more than `fraction_sun` of
+        the 95th percentile of the radiances.
+        A row with too few pixels on the Sun keeps a gain of one, and if too
+        few rows have enough, the radiances are left as they are.
+
+        Parameters
+        ----------
+        fraction_sun
+            The least radiance of a pixel on the Sun,
+            relative to the 95th percentile of the radiances.
+        num_min
+            The least number of pixels on the Sun a row needs for its gain.
+        size
+            The number of rows the running median is taken over.
+        gain_min
+            The smallest gain of a row.
+        gain_max
+            The largest gain of a row.
+        """
+        radiance = self._radiance_aligned()
+        total = np.nansum(radiance, axis=~0)
+        sun = total > fraction_sun * np.percentile(total, 95)
+        rows = np.full(total.shape[1], np.nan)
+        for j in range(total.shape[1]):
+            if sun[:, j].sum() >= num_min:
+                rows[j] = np.median(total[sun[:, j], j])
+        valid = np.isfinite(rows)
+        if valid.sum() < 2 * size:
+            return self
+        filled = np.interp(np.arange(len(rows)), np.flatnonzero(valid), rows[valid])
+        smooth = scipy.ndimage.median_filter(filled, size=size, mode="nearest")
+        gain = np.where(valid, np.clip(filled / smooth, gain_min, gain_max), 1)
+        return self._with_radiance(radiance / gain[np.newaxis, :, np.newaxis])
 
     def show(
         self,
