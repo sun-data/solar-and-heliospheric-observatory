@@ -38,10 +38,13 @@ The number of files downloaded at once,
 since most of the time of each one is spent waiting for the server.
 """
 
-_delay_retry = 1
+_delay_retry = 4
 """
 The number of seconds to wait before trying a request again,
 which is doubled before each further try.
+
+ESA's catalogue sometimes resets connections for tens of seconds at a time,
+so five tries wait for a minute in all.
 """
 
 _status_retry = (408, 429)
