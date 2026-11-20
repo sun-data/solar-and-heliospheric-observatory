@@ -226,6 +226,34 @@ class TestSpectrographObservation:
                 order=1,
             )
 
+    def test_velocity_zero(self, path_test: pathlib.Path):
+        kwargs = dict(path=path_test, wavelength=_wavelength, order=2)
+        files = soho.sumer.SpectrographObservation.from_level1(
+            velocity_zero=None,
+            **kwargs,
+        )
+        assert files.shift_wavelength == 0 * u.AA
+
+        zeroed = soho.sumer.SpectrographObservation.from_level1(**kwargs)
+        wavelengths = zeroed.inputs.wavelength.ndarray
+        centers = (wavelengths[1:] + wavelengths[:-1]) / 2
+        profile = np.nanmean(zeroed.outputs.ndarray.value, axis=(0, 1))
+        peak = centers[np.argmax(profile)]
+        dispersion = np.diff(wavelengths).mean()
+        assert abs(peak - _wavelength) < 2 * dispersion
+        assert np.allclose(
+            wavelengths + zeroed.shift_wavelength,
+            files.inputs.wavelength.ndarray,
+        )
+
+        velocity = 30 * u.km / u.s
+        shifted = soho.sumer.SpectrographObservation.from_level1(
+            velocity_zero=velocity,
+            **kwargs,
+        )
+        expected = velocity.to(u.AA, equivalencies=u.doppler_optical(_wavelength))
+        assert np.isclose(shifted.shift_wavelength, expected - _wavelength)
+
     def test_show(self, path_test: pathlib.Path):
         result = soho.sumer.SpectrographObservation.from_level1(
             path=path_test,

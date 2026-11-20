@@ -1,4 +1,4 @@
-from typing import Callable, Iterator, Sequence
+from typing import Callable, Iterator, Literal, Sequence
 import typing
 import contextlib
 import io
@@ -47,6 +47,21 @@ exposures for them to be loaded together.
 The level-1 files correct the geometry of each exposure on its own,
 so the wavelength scale of a window changes by a few thousandths of a column
 from one exposure to the next.
+"""
+
+_velocity_search = u.Quantity(100, u.km / u.s)
+"""
+How far from the wavelength of the line the brightest part of the mean
+profile is looked for, when the line is zeroed on its mean position.
+
+SUMER's wavelength scale is off by up to about 50 km/s, and the limit keeps a
+brighter line which shares the window from being taken for the line.
+"""
+
+_velocity_centroid = u.Quantity(100, u.km / u.s)
+"""
+How far on either side of the brightest part of the mean profile the
+centroid of the line is found, when the line is zeroed on its mean position.
 """
 
 _unit_radiance = u.W / (u.sr * u.m**2 * u.AA)
@@ -234,6 +249,56 @@ def _extent(data: np.ndarray, column: int) -> None | tuple[int, int]:
     return first, last
 
 
+def _centroid(
+    radiance: np.ndarray,
+    wavelengths: np.ndarray,
+    wavelength: float,
+) -> float:
+    """
+    The mean position of a line in some exposures:
+    the centroid, above its lowest value, of their mean profile near its
+    brightest part, which is looked for near the wavelength of the line.
+
+    Parameters
+    ----------
+    radiance
+        The spectra, with wavelength along the last axis.
+    wavelengths
+        The edges of the columns, in angstroms.
+    wavelength
+        The wavelength of the line, in angstroms.
+
+    Raises
+    ------
+    ValueError
+        If the spectra have no data near the wavelength of the line.
+    """
+    with warnings.catch_warnings():
+        # columns which no exposure read out have no mean
+        warnings.simplefilter("ignore", RuntimeWarning)
+        profile = np.nanmean(radiance.reshape(-1, radiance.shape[~0]), axis=0)
+    centers = (wavelengths[1:] + wavelengths[:-1]) / 2
+    velocity = np.asarray(
+        u.Quantity(centers, u.AA).to_value(
+            u.km / u.s,
+            equivalencies=u.doppler_optical(wavelength * u.AA),
+        )
+    )
+    search = _velocity_search.to_value(u.km / u.s)
+    candidates = np.isfinite(profile) & (np.abs(velocity) < search)
+    if not np.any(candidates):
+        raise ValueError(
+            f"The spectra have no data within {_velocity_search} of {wavelength} A."
+        )
+    peak = velocity[candidates][np.argmax(profile[candidates])]
+    width = _velocity_centroid.to_value(u.km / u.s)
+    near = np.isfinite(profile) & (np.abs(velocity - peak) < width)
+    excess = profile[near] - np.min(profile[near])
+    if not np.sum(excess) > 0:
+        return float(centers[near][np.argmax(profile[near])])
+    return float(np.sum(excess * centers[near]) / np.sum(excess))
+
+
 def _vertices(centers: np.ndarray, width: float) -> np.ndarray:
     """
     The edges between consecutive positions along a raster,
@@ -302,9 +367,14 @@ class SpectrographObservation(
     and the wavelengths are those of the line which was observed,
     in :attr:`order`.
 
-    SUMER has no absolute wavelength scale, so the wavelengths are only as
-    good as the reference wavelengths of the windows, which are those of the
-    lines that were planned for.
+    SUMER has no absolute wavelength scale:
+    the files place the wavelength a window was planned for at a reference
+    column, and the line can lie several columns from it,
+    tens of kilometers per second in Doppler velocity.
+    So by default the wavelengths are shifted to put the mean position of the
+    line in the loaded exposures at its rest wavelength,
+    which removes any real net shift of the region too,
+    and :attr:`shift_wavelength` records the shift.
 
     The radiances are those of the level-1 files, which are calibrated for the
     first order of the grating (``RADORDER = 1``) per angstrom.
@@ -329,6 +399,15 @@ class SpectrographObservation(
 
     slit: str = ""
     """The slit, as the files name it, such as ``<2> 1.0" * 300" centered``."""
+
+    shift_wavelength: u.Quantity = dataclasses.field(
+        default_factory=lambda: 0 * u.AA,
+    )
+    """
+    How far the wavelengths were moved from those the files give,
+    to zero the line as :meth:`from_level1` was asked to.
+    Add it to the wavelengths to get those of the files.
+    """
 
     axis_wavelength: str = "wavelength"
     """The logical axis corresponding to changes in wavelength."""
@@ -355,6 +434,7 @@ class SpectrographObservation(
         time_stop: None | str | astropy.time.Time = None,
         timedelta: None | u.Quantity = None,
         slit: None | str = None,
+        velocity_zero: None | Literal["mean"] | u.Quantity = "mean",
         axis_wavelength: str = "wavelength",
         axis_detector_x: str = "detector_x",
         axis_detector_y: str = "detector_y",
@@ -395,6 +475,14 @@ class SpectrographObservation(
         slit
             The slit of the exposures to keep, as the files name it.
             If :obj:`None`, exposures through any slit are kept.
+        velocity_zero
+            Where to put the zero of the Doppler velocity,
+            since SUMER has no absolute wavelength scale.
+            If ``"mean"`` (the default), the wavelengths are shifted to put the
+            mean position of the line in the kept exposures at `wavelength`.
+            If a velocity, they are shifted to put that velocity,
+            on the scale the files give, at `wavelength`.
+            If :obj:`None`, the wavelengths are those the files give.
         axis_wavelength
             The logical axis corresponding to changes in wavelength.
         axis_detector_x
@@ -533,6 +621,23 @@ class SpectrographObservation(
         index_column = lower + np.arange(num + 1) - 0.5
         wavelengths = (wavelength_first + index_column * dispersion) * u.AA
 
+        rest = wavelength.to(u.AA)
+        if velocity_zero is None:
+            shift = 0 * u.AA
+        elif isinstance(velocity_zero, str):
+            if velocity_zero != "mean":
+                raise ValueError(f"{velocity_zero=} not recognized.")
+            centroid = _centroid(
+                radiance=np.stack(radiance),
+                wavelengths=wavelengths.to_value(u.AA),
+                wavelength=rest.value,
+            )
+            shift = centroid * u.AA - rest
+        else:
+            zero = velocity_zero.to(u.AA, equivalencies=u.doppler_optical(rest))
+            shift = zero - rest
+        wavelengths = wavelengths - shift
+
         num_row = header["NAXIS2"]
         index_row = np.arange(num_row + 1) + 0.5
         cdelt2 = np.array([h["CDELT2"] for h in headers])
@@ -571,6 +676,7 @@ class SpectrographObservation(
             ),
             order=order,
             detector=header["DETECTOR"].strip(),
+            shift_wavelength=shift,
             slit=header["SLIT"],
             axis_wavelength=axis_wavelength,
             axis_detector_x=axis_detector_x,
@@ -586,6 +692,7 @@ class SpectrographObservation(
         order: int,
         timedelta: None | u.Quantity = None,
         slit: None | str = None,
+        velocity_zero: None | Literal["mean"] | u.Quantity = "mean",
         axis_wavelength: str = "wavelength",
         axis_detector_x: str = "detector_x",
         axis_detector_y: str = "detector_y",
@@ -614,6 +721,14 @@ class SpectrographObservation(
         slit
             The slit of the exposures to keep, as the files name it.
             If :obj:`None`, exposures through any slit are kept.
+        velocity_zero
+            Where to put the zero of the Doppler velocity,
+            since SUMER has no absolute wavelength scale.
+            If ``"mean"`` (the default), the wavelengths are shifted to put the
+            mean position of the line in the kept exposures at `wavelength`.
+            If a velocity, they are shifted to put that velocity,
+            on the scale the files give, at `wavelength`.
+            If :obj:`None`, the wavelengths are those the files give.
         axis_wavelength
             The logical axis corresponding to changes in wavelength.
         axis_detector_x
@@ -644,6 +759,7 @@ class SpectrographObservation(
             time_stop=time_stop,
             timedelta=timedelta,
             slit=slit,
+            velocity_zero=velocity_zero,
             axis_wavelength=axis_wavelength,
             axis_detector_x=axis_detector_x,
             axis_detector_y=axis_detector_y,

@@ -1,3 +1,4 @@
+from typing import Literal
 import pathlib
 import astropy.units as u
 import astropy.time
@@ -15,6 +16,7 @@ def open(
     order: int,
     timedelta: None | u.Quantity = None,
     slit: None | str = None,
+    velocity_zero: None | Literal["mean"] | u.Quantity = "mean",
     axis_wavelength: str = "wavelength",
     axis_detector_x: str = "detector_x",
     axis_detector_y: str = "detector_y",
@@ -46,6 +48,9 @@ def open(
     slit
         The slit of the exposures to keep, as the files name it.
         If :obj:`None`, exposures through any slit are kept.
+    velocity_zero
+        Where to put the zero of the Doppler velocity,
+        as in :meth:`~soho.sumer.SpectrographObservation.from_level1`.
     axis_wavelength
         The logical axis corresponding to changes in wavelength.
     axis_detector_x
@@ -68,6 +73,7 @@ def open(
         order=order,
         timedelta=timedelta,
         slit=slit,
+        velocity_zero=velocity_zero,
         axis_wavelength=axis_wavelength,
         axis_detector_x=axis_detector_x,
         axis_detector_y=axis_detector_y,
