@@ -277,7 +277,8 @@ class SpectrographObservation(
 
     The spectrum is that of the columns around the window which hold data in
     any exposure, and each exposure is not a number (NaN) in the columns
-    outside its own data.
+    outside its own data,
+    so integrate over wavelength with :func:`numpy.nansum`.
     The windows of an image are the parts of the detector which were read out,
     and those around one line can lie side by side,
     so the spectrum can reach past the limits of the window the line was

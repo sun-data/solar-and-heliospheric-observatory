@@ -5,7 +5,7 @@
 [![Black](https://github.com/sun-data/solar-and-heliospheric-observatory/actions/workflows/black.yml/badge.svg)](https://github.com/sun-data/solar-and-heliospheric-observatory/actions/workflows/black.yml)
 [![Ruff](https://github.com/sun-data/solar-and-heliospheric-observatory/actions/workflows/ruff.yml/badge.svg)](https://github.com/sun-data/solar-and-heliospheric-observatory/actions/workflows/ruff.yml)
 [![typing](https://github.com/sun-data/solar-and-heliospheric-observatory/actions/workflows/typing.yml/badge.svg)](https://github.com/sun-data/solar-and-heliospheric-observatory/actions/workflows/typing.yml)
-[![Documentation Status](https://readthedocs.org/projects/solar-and-heliospheric-observatory/badge/?version=latest)](https://solar-and-heliospheric-observatory.readthedocs.io/en/latest/?badge=latest)
+[![Documentation Status](https://readthedocs.org/projects/soho-mission/badge/?version=latest)](https://soho-mission.readthedocs.io/en/latest/?badge=latest)
 [![PyPI version](https://badge.fury.io/py/solar-and-heliospheric-observatory.svg)](https://badge.fury.io/py/solar-and-heliospheric-observatory)
 
 A Python library to download and analyze observations from the

@@ -15,7 +15,7 @@ authors:
     given-names: Roy T.
     orcid: "https://orcid.org/0000-0002-9997-5515"
 repository-code: "https://github.com/sun-data/solar-and-heliospheric-observatory"
-url: "https://solar-and-heliospheric-observatory.readthedocs.io"
+url: "https://soho-mission.readthedocs.io"
 license: BSD-3-Clause
 keywords:
   - SOHO

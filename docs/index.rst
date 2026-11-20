@@ -47,6 +47,7 @@ of the slit.
 
 .. jupyter-execute::
 
+    import numpy as np
     import matplotlib
     import matplotlib.pyplot as plt
     import astropy.units as u
@@ -62,9 +63,10 @@ of the slit.
         order=2,
     )
 
-    # Integrate over the line
+    # Integrate over the line, leaving out the columns which an exposure
+    # did not read out
     dw = obs.inputs.wavelength.volume_cell(obs.axis_wavelength)
-    radiance = (obs.outputs * dw).sum(obs.axis_wavelength)
+    radiance = np.nansum(obs.outputs * dw, axis=obs.axis_wavelength)
 
     # Display the radiance
     with astropy.visualization.quantity_support():

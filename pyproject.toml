@@ -43,7 +43,7 @@ doc = [
 
 [project.urls]
 Homepage = "https://github.com/sun-data/solar-and-heliospheric-observatory"
-Documentation = "https://solar-and-heliospheric-observatory.readthedocs.io/en/latest"
+Documentation = "https://soho-mission.readthedocs.io/en/latest"
 
 [tool.setuptools.packages.find]
 include = ["soho*"]
