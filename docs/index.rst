@@ -39,30 +39,33 @@ API Reference
 Examples
 ========
 
-Load the raster of a prominence above the northwest limb which SUMER observed
-on 1996 April 10 in N V 1242.8 angstroms, in the first order of its grating,
+Load the quiet-Sun raster which SUMER observed near disk center on
+1996 September 16 in O V 629.7 angstroms, in the second order of its grating,
 and display it as a false-color image,
 whose hue is the Doppler velocity and whose brightness is the radiance.
+The velocity is zero at the mean position of the line in the raster,
+and the pairs of blue and red spots are explosive events.
 
 .. jupyter-execute::
 
     import astropy.units as u
     import soho
 
-    # Download the raster and load the window of N V into memory
+    # Download the raster and load the window of O V into memory
     obs = soho.sumer.open(
-        time_start="1996-04-10T08:04",
-        time_stop="1996-04-10T12:11",
-        wavelength=1242.80 * u.AA,
-        order=1,
+        time_start="1996-09-16T16:07",
+        time_stop="1996-09-16T22:49",
+        wavelength=629.73 * u.AA,
+        order=2,
     )
 
-    # Display the prominence
+    # Display the raster, without the rows of the detector beyond the ends of
+    # the slit
     ax = obs.show(
-        velocity_min=-60 * u.km / u.s,
-        velocity_max=+60 * u.km / u.s,
+        velocity_min=-100 * u.km / u.s,
+        velocity_max=+100 * u.km / u.s,
     )
-    ax.set_ylim(570, 790);
+    ax.set_ylim(-160, 170);
 
 References
 ==========
