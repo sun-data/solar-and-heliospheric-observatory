@@ -1,5 +1,6 @@
 from typing import Callable, Iterator, Sequence
 import typing
+import contextlib
 import io
 import os
 import pathlib
@@ -726,7 +727,13 @@ class SpectrographObservation(
             percentile = typing.cast(Callable[..., na.AbstractScalar], np.nanpercentile)
             vmax = percentile(outputs, q=99.5, axis=(axis_x, axis_y))
 
-        with astropy.visualization.quantity_support():
+        # Recent versions of astropy annotate what quantity_support returns as
+        # something which cannot be used in a with statement, though it can.
+        support = typing.cast(
+            contextlib.AbstractContextManager,
+            astropy.visualization.quantity_support(),
+        )
+        with support:
             cax_twin = cax.twinx()
             colorbar = na.plt.rgbmesh(
                 self.inputs.velocity,
