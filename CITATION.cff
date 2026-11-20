@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use solar-and-heliospheric-observatory in your research, please cite it using these metadata."
+type: software
+title: solar-and-heliospheric-observatory
+abstract: >-
+  solar-and-heliospheric-observatory is a Python library for downloading and
+  analyzing observations from the Solar and Heliospheric Observatory (SOHO),
+  starting with the spectra of the Solar Ultraviolet Measurements of Emitted
+  Radiation (SUMER) spectrograph. Observations are represented as
+  named-arrays function arrays, so a sequence of spectra has named axes and
+  physical units, and carries the time, sky position, and wavelength of every
+  pixel.
+authors:
+  - family-names: Smart
+    given-names: Roy T.
+    orcid: "https://orcid.org/0000-0002-9997-5515"
+repository-code: "https://github.com/sun-data/solar-and-heliospheric-observatory"
+url: "https://solar-and-heliospheric-observatory.readthedocs.io"
+license: BSD-3-Clause
+keywords:
+  - SOHO
+  - SUMER
+  - solar physics
+  - data access
