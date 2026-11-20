@@ -1,4 +1,5 @@
 import os
+import re
 import csv
 import time
 import uuid
@@ -7,6 +8,7 @@ import pathlib
 import functools
 import concurrent.futures
 import requests
+import urllib3.exceptions
 import joblib
 import numpy as np
 import astropy.time
@@ -59,6 +61,22 @@ _errors_retry = (
     requests.exceptions.ChunkedEncodingError,
 )
 """The errors of a request which may not happen if it is tried again."""
+
+_errors_stream = _errors_retry + (
+    urllib3.exceptions.ProtocolError,
+    urllib3.exceptions.ReadTimeoutError,
+)
+"""
+The errors of reading the body of a response a piece at a time,
+which may not happen if it is read again,
+such as the server ending it before the length it promised.
+"""
+
+_pattern_error_tap = re.compile(
+    r'<INFO name="QUERY_STATUS" value="ERROR">(.*?)</INFO>',
+    re.DOTALL,
+)
+"""The message with which a TAP service refuses a query."""
 
 _delay_replace = 0.1
 """
@@ -167,6 +185,11 @@ def _catalog(
     -------
         The answer of the catalogue, as comma-separated values with a header,
         with the name, start and end of each file.
+
+    Raises
+    ------
+    ValueError
+        If the catalogue refuses the query, with its reason.
     """
     adql = (
         "SELECT o.file_name, o.begin_date, o.end_date "
@@ -177,7 +200,15 @@ def _catalog(
         "ORDER BY o.begin_date"
     )
     data = {"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": adql}
-    return _get(_url_tap, num_retry, data=data).text
+    try:
+        return _get(_url_tap, num_retry, data=data).text
+    except requests.exceptions.HTTPError as e:
+        text = "" if e.response is None else e.response.text
+        match = _pattern_error_tap.search(text)
+        if match is None:
+            raise
+        message = " ".join(match.group(1).split())
+        raise ValueError(f"ESA's catalogue refused the query: {message}") from e
 
 
 @functools.cache
@@ -241,8 +272,9 @@ def urls(
             time_stop="1996-09-16T16:08",
         )
     """
-    start = astropy.time.Time(time_start).isot
-    stop = astropy.time.Time(time_stop).isot
+    # The catalogue gives its times in UTC.
+    start = typing.cast(astropy.time.Time, astropy.time.Time(time_start).utc).isot
+    stop = typing.cast(astropy.time.Time, astropy.time.Time(time_stop).utc).isot
 
     text = _catalog_cached(soho.memory)(start, stop, num_retry)
     names = [row["file_name"] for row in csv.DictReader(text.splitlines())]
@@ -323,6 +355,8 @@ def _download_file(
     The file is written next to its final place under a name no other
     download uses, and then moved, so an interrupted download never looks
     finished.
+    A download which breaks off or comes up short is tried again,
+    waiting twice as long before each try, starting from :data:`_delay_retry`.
 
     Parameters
     ----------
@@ -340,8 +374,9 @@ def _download_file(
     Raises
     ------
     ValueError
-        If the file is shorter than the server said it would be,
-        or is not a gzip file.
+        If the file is not a gzip file.
+    ConnectionError
+        If no try got the whole file.
     """
     path = _path_local(url, directory)
 
@@ -349,15 +384,28 @@ def _download_file(
         path.parent.mkdir(parents=True, exist_ok=True)
         part = path.with_name(f"{path.name}.{uuid.uuid4().hex}.part")
         try:
-            with _get(url, num_retry, stream=True) as response:
-                size = int(response.headers.get("Content-Length", -1))
-                with open(part, "xb") as file:
-                    for chunk in response.iter_content(chunk_size=1 << 20):
-                        file.write(chunk)
-            if size >= 0 and part.stat().st_size != size:
-                raise ValueError(
+            error = None
+            for i in range(num_retry):
+                if i > 0:
+                    time.sleep(_delay_retry * 2 ** (i - 1))
+                try:
+                    with _get(url, num_retry, stream=True) as response:
+                        size = int(response.headers.get("Content-Length", -1))
+                        with open(part, "wb") as file:
+                            for chunk in response.iter_content(chunk_size=1 << 20):
+                                file.write(chunk)
+                except _errors_stream as e:
+                    error = e
+                    continue
+                if size < 0 or part.stat().st_size == size:
+                    break
+                error = ConnectionError(
                     f"Got {part.stat().st_size} of the {size} bytes of {url}."
                 )
+            else:
+                raise ConnectionError(
+                    f"Could not download {url} in {num_retry} tries."
+                ) from error
             with open(part, "rb") as file:
                 start = file.read(len(_signature_gzip))
             if start != _signature_gzip:

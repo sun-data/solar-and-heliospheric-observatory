@@ -1,4 +1,5 @@
 import pathlib
+import dataclasses
 import pytest
 import numpy as np
 import matplotlib.axes
@@ -6,27 +7,11 @@ import matplotlib.pyplot as plt
 import astropy.units as u
 import astropy.time
 import astropy.io.fits
-import named_arrays as na
 import soho
-from soho.sumer._data import _url
 from soho.sumer._spectrograph import _window, _extent, _vertices
-
-_name_test = "sum_20050415_153008_l1.tgz"
-"""
-A small level-1 file, whose window on O V 629.7 angstroms, in the second
-order, is labelled with its place in the first order.
-"""
 
 _wavelength = 629.73 * u.AA
 """The wavelength of O V."""
-
-
-@pytest.fixture(scope="module")
-def path_test(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
-    """The test file, downloaded once for the module."""
-    directory = tmp_path_factory.mktemp("sumer")
-    urls = na.ScalarArray(np.array([_url(_name_test)]), axes="time")
-    return pathlib.Path(str(soho.sumer.download(urls, directory).ndarray[0]))
 
 
 def _header(**cards: float | int | str) -> astropy.io.fits.Header:
@@ -46,6 +31,8 @@ def _header(**cards: float | int | str) -> astropy.io.fits.Header:
                 PIMGTYP="MULTIPLE",
                 ONUMIMG=2,
                 CDELT1=0.0437,
+                CRVAL1=1242.01,
+                CRPIX1=463,
                 WAVEL1=1242.01,
                 WAVEMIN1=1240.92,
                 WAVEMAX1=1243.10,
@@ -59,21 +46,84 @@ def _header(**cards: float | int | str) -> astropy.io.fits.Header:
             2,
             (837, 50, 629.73 - 25 * 0.0437 / 2, 0.0437 / 2),
         ),
-        # several windows, labelled with their place in the first order,
-        # and CDELT1 in the second order
+        # several windows, the second labelled with its place in the first
+        # order, and CDELT1 in the second order, that of the first window
+        (
+            _header(
+                PIMGTYP="MULTIPLE",
+                ONUMIMG=2,
+                CDELT1=0.0218,
+                CRVAL1=624.94,
+                CRPIX1=300,
+                WAVEL1=624.94,
+                WAVEMIN1=624.394,
+                WAVEMAX1=625.486,
+                IREFPIX1=300,
+                WAVEL2=1259.46,
+                WAVEMIN2=1258.37,
+                WAVEMAX2=1260.55,
+                IREFPIX2=520,
+            ),
+            629.73 * u.AA,
+            2,
+            (494, 50, (1259.46 - 25 * 0.0436) / 2, 0.0218),
+        ),
+        # a line of the first order in a window labelled in the second order,
+        # as S II 1250.58 lies in the window of Mg X 625.0
+        (
+            _header(
+                PIMGTYP="MULTIPLE",
+                ONUMIMG=2,
+                CDELT1=0.0437241,
+                CRVAL1=1242.01,
+                CRPIX1=463,
+                WAVEL1=1242.01,
+                WAVEMIN1=1240.92,
+                WAVEMAX1=1243.10,
+                IREFPIX1=463,
+                WAVEL2=625.0,
+                WAVEMIN2=624.453,
+                WAVEMAX2=625.547,
+                IREFPIX2=646,
+            ),
+            1250.58 * u.AA,
+            1,
+            (620, 50, 1250.0 - 25 * 0.0437241, 0.0437241),
+        ),
+        # a window labelled in the first order between 660 and 805 angstroms,
+        # which does not hold a line of the second order of the same number
         (
             _header(
                 PIMGTYP="MULTIPLE",
                 ONUMIMG=1,
-                CDELT1=0.0218,
-                WAVEL1=1259.46,
-                WAVEMIN1=1258.37,
-                WAVEMAX1=1260.55,
-                IREFPIX1=200,
+                CDELT1=0.0446,
+                CRVAL1=770.42,
+                CRPIX1=300,
+                WAVEL1=770.42,
+                WAVEMIN1=769.30,
+                WAVEMAX1=771.53,
+                IREFPIX1=300,
             ),
-            629.73 * u.AA,
+            770.42 * u.AA,
             2,
-            (174, 50, (1259.46 - 25 * 0.0436) / 2, 0.0218),
+            None,
+        ),
+        # but does hold the line of the first order
+        (
+            _header(
+                PIMGTYP="MULTIPLE",
+                ONUMIMG=1,
+                CDELT1=0.0446,
+                CRVAL1=770.42,
+                CRPIX1=300,
+                WAVEL1=770.42,
+                WAVEMIN1=769.30,
+                WAVEMAX1=771.53,
+                IREFPIX1=300,
+            ),
+            770.42 * u.AA,
+            1,
+            (274, 50, 770.42 - 25 * 0.0446, 0.0446),
         ),
         # one window, the whole image
         (
@@ -140,21 +190,27 @@ def test_window(
 
 
 @pytest.mark.parametrize(
-    argnames="data,column,expected",
+    argnames="filled,column,expected",
     argvalues=[
-        (np.array([[0, 1, 2, 0, 3]]), 1, (1, 3)),
-        (np.array([[0, 1, 2, 0, 3]]), 4, (4, 5)),
-        (np.array([[0, 1, 2, 0, 3]]), 3, None),
-        (np.array([[1, 1, 1]]), 0, (0, 3)),
-        (np.array([[np.nan, 1, 1]]), 2, (1, 3)),
+        # a dead column is bridged
+        (np.array([0, 1, 1, 0, 1], dtype=bool), 1, (1, 5)),
+        # a gap of three columns is not
+        (np.array([1, 0, 0, 0, 1], dtype=bool), 0, (0, 1)),
+        (np.array([1, 0, 0, 0, 1], dtype=bool), 4, (4, 5)),
+        # a column without data next to a run is reached by it
+        (np.array([1, 1, 0, 0, 0, 0], dtype=bool), 3, (0, 2)),
+        # but not one further away
+        (np.array([1, 1, 0, 0, 0, 0], dtype=bool), 4, None),
+        (np.array([1, 1, 1], dtype=bool), 0, (0, 3)),
+        (np.array([0, 0, 0], dtype=bool), 1, None),
     ],
 )
 def test_extent(
-    data: np.ndarray,
+    filled: np.ndarray,
     column: int,
     expected: None | tuple[int, int],
 ):
-    assert _extent(data, column) == expected
+    assert _extent(filled, column) == expected
 
 
 @pytest.mark.parametrize(
@@ -162,6 +218,8 @@ def test_extent(
     argvalues=[
         (np.array([0.0, 1.0, 2.0]), 0.5, np.array([-0.5, 0.5, 1.5, 2.5])),
         (np.array([3.0]), 1.0, np.array([2.5, 3.5])),
+        # a sequence which holds the slit still
+        (np.array([3.0, 3.0]), 1.0, np.array([3.0, 3.0, 3.0])),
     ],
 )
 def test_vertices(
@@ -262,7 +320,35 @@ class TestSpectrographObservation:
         )
         ax = result.show()
         assert isinstance(ax, matplotlib.axes.Axes)
-        plt.close(ax.figure)
+        plt.close("all")
+
+    def test_show_still(self, path_test: pathlib.Path):
+        result = soho.sumer.SpectrographObservation.from_level1(
+            path=path_test,
+            wavelength=_wavelength,
+            order=2,
+        )
+        position = result.inputs.position
+        x = 0 * position.x + position.x[{result.axis_detector_x: 0}]
+        still = dataclasses.replace(
+            result,
+            inputs=dataclasses.replace(
+                result.inputs,
+                position=dataclasses.replace(position, x=x),
+            ),
+        )
+        with pytest.raises(ValueError, match="not a raster"):
+            still.show()
+        plt.close("all")
+
+    def test_from_level1_timedelta_tolerance(self, path_test: pathlib.Path):
+        result = soho.sumer.SpectrographObservation.from_level1(
+            path=path_test,
+            wavelength=_wavelength,
+            order=2,
+            timedelta=15.01 * u.s,
+        )
+        assert result.outputs.shape["detector_x"] == 76
 
     def test_from_level1_timedelta(self, path_test: pathlib.Path):
         with pytest.raises(ValueError, match="No exposure"):

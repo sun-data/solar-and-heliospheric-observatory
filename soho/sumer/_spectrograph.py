@@ -39,14 +39,36 @@ of many level-1 files of SUMER, whose names of scientists have letters
 outside of ASCII, and which says nothing about the data.
 """
 
-_tolerance_window = 0.1
+_gap_max = 2
 """
-How far apart, in columns, the wavelengths of one window may be in two
-exposures for them to be loaded together.
+The most columns without data which are bridged inside a run of read-out
+columns.
+
+A dead column of the detector holds no data, and splitting the run there
+would lose the columns beyond it.
+"""
+
+_tolerance_window = 0.5
+"""
+How far apart, in columns, the middles of one window may be in two exposures
+for them to be loaded together.
 
 The level-1 files correct the geometry of each exposure on its own,
-so the wavelength scale of a window changes by a few thousandths of a column
-from one exposure to the next.
+so the wavelength scale of a window moves a little from one exposure to the
+next.
+"""
+
+_tolerance_dispersion = 1e-3
+"""
+How far apart, relative to it, the size of a column of one window may be in
+two exposures for them to be loaded together.
+"""
+
+_tolerance_timedelta = 1e-3
+"""
+How far apart, relative to it, an exposure time may be from the one asked for
+to be kept, since the files give, for example, 100.01 s for some exposures of
+a sequence of 100 s.
 """
 
 _velocity_search = u.Quantity(100, u.km / u.s)
@@ -67,6 +89,16 @@ centroid of the line is found, when the line is zeroed on its mean position.
 _unit_radiance = u.W / (u.sr * u.m**2 * u.AA)
 """The unit of the level-1 radiances, which the files call ``W/sr/m^2/Angstroem``."""
 
+_units_level1 = "W/sr/m^2/Angstroem"
+"""How the level-1 files name the unit of their radiances, :data:`_unit_radiance`."""
+
+# named-arrays takes the names of axes where numpy takes numbers,
+# which the annotations of numpy do not allow.
+_nanmean = typing.cast(Callable[..., na.ScalarArray], np.nanmean)
+_nanpercentile = typing.cast(Callable[..., na.ScalarArray], np.nanpercentile)
+_diff = typing.cast(Callable[..., na.ScalarArray], np.diff)
+_where = typing.cast(Callable[..., na.ScalarArray], np.where)
+
 
 @dataclasses.dataclass(frozen=True)
 class _Window:
@@ -83,6 +115,51 @@ class _Window:
 
     dispersion: float
     """The size of a column in wavelength, in angstroms."""
+
+    @property
+    def middle(self) -> float:
+        """The wavelength of the middle of the window, in angstroms."""
+        return self.wavelength + (self.num - 1) / 2 * self.dispersion
+
+    def column(self, wavelength: float) -> int:
+        """
+        The column of the image which holds a wavelength.
+
+        Parameters
+        ----------
+        wavelength
+            The wavelength, in angstroms.
+        """
+        return self.start + int(
+            np.rint((wavelength - self.wavelength) / self.dispersion)
+        )
+
+
+@dataclasses.dataclass
+class _Exposure:
+    """What is kept of one exposure while a sequence is loaded."""
+
+    time: astropy.time.Time
+    """The start of the exposure."""
+
+    header: astropy.io.fits.Header
+    """The primary header of the exposure."""
+
+    window: _Window
+    """The window which holds the line."""
+
+    extent: None | tuple[int, int]
+    """
+    The first column, and the one after the last, of the run of read-out
+    columns around the line, counted from the start of the window,
+    or :obj:`None` if the line was not read out.
+    """
+
+    radiance: None | np.ndarray
+    """
+    The radiance of the columns of :attr:`extent`, along the slit and in
+    wavelength, NaN in the columns which hold no data.
+    """
 
 
 def _members(path: str | os.PathLike) -> Iterator[bytes]:
@@ -104,7 +181,7 @@ def _members(path: str | os.PathLike) -> Iterator[bytes]:
                 yield content.read()
 
 
-def _number(header: astropy.io.fits.Header, key: str) -> float:
+def _number(header: astropy.io.fits.Header, key: str, default: float = 0) -> float:
     """
     The value of a numeric card of a header.
 
@@ -114,8 +191,10 @@ def _number(header: astropy.io.fits.Header, key: str) -> float:
         The header.
     key
         The keyword of the card.
+    default
+        The value if the header has no such card.
     """
-    return float(typing.cast(float, header[key]))
+    return float(typing.cast(float, header.get(key, default)))
 
 
 def _text(header: astropy.io.fits.Header, key: str, default: str = "") -> str:
@@ -134,6 +213,52 @@ def _text(header: astropy.io.fits.Header, key: str, default: str = "") -> str:
     return str(typing.cast(str, header.get(key, default))).strip()
 
 
+def _window_spanning(
+    column: int,
+    reference: float,
+    minimum: float,
+    maximum: float,
+    dispersion_first: float,
+    order: int,
+) -> _Window:
+    """
+    A window from its limits and its reference wavelength and column,
+    with its wavelengths in the order of the line it is loaded for.
+
+    The limits are the reference wavelength less and more half the width of
+    the window, rounded down to whole columns,
+    so the lower limit is the middle of the first column,
+    and the upper one is the middle of the last column of a window with an
+    odd number of columns but of the column after it otherwise.
+    The window is taken to end before the upper limit,
+    so that images of one window and images of several,
+    which one sequence can mix, give it the same number of columns.
+
+    Parameters
+    ----------
+    column
+        The column of the reference wavelength, counting from zero.
+    reference
+        The reference wavelength, in angstroms of the first order,
+        that is, its place on the detector.
+    minimum
+        The lower limit of the window, in angstroms of the first order.
+    maximum
+        The upper limit of the window, in angstroms of the first order.
+    dispersion_first
+        The size of a column, in angstroms of the first order.
+    order
+        The diffraction order of the line.
+    """
+    offset = int(np.rint((reference - minimum) / dispersion_first))
+    return _Window(
+        start=column - offset,
+        num=int(np.rint((maximum - minimum) / dispersion_first)),
+        wavelength=(reference - offset * dispersion_first) / order,
+        dispersion=dispersion_first / order,
+    )
+
+
 def _window(
     header: astropy.io.fits.Header,
     wavelength: u.Quantity,
@@ -150,29 +275,18 @@ def _window(
     and limits ``WAVEMINn`` and ``WAVEMAXn``;
     or one window, the whole image (``PIMGTYP = 'SINGLE'``),
     described by ``CRVAL1``, ``CRPIX1``, ``WAVEMIN``, and ``WAVEMAX``.
-    The limits are the reference wavelength less and more half the width of
-    the window, rounded down to whole columns,
-    so ``WAVEMIN`` is the middle of the first column,
-    and ``WAVEMAX`` is the middle of the last column of a window with an odd
-    number of columns but of the column after it otherwise.
-    The window is taken to end before ``WAVEMAX``,
-    so that both kinds of image, which one sequence can mix,
-    give it the same number of columns.
-    Which columns hold data is found from the images themselves,
-    by :meth:`SpectrographObservation.from_level1`.
 
-    The files do not say in which order the wavelengths of a window are given.
-    Those of a single window are in the order of ``CDELT1``,
-    which is plain from its size.
-    Those of one of several windows are either in the order of the line it
-    was planned for, such as 629.2 to 630.3 angstroms for O V 629.7 in the
-    second order,
-    or in the first order, the place of that line on the detector,
-    such as 1258.4 to 1260.6 angstroms for the same window.
-    So a window holds the line if either range holds it.
-    Neither can be mistaken for the other, since a line in the second order
-    lies at more than 660 angstroms of the first order,
-    where no window labelled in the second order reaches.
+    The wavelengths of a window are those of the line it was planned for,
+    in the order of that line or in the first order,
+    and the files do not say which.
+    ``CRVAL1``, at ``CRPIX1``, is in the order of ``CDELT1``,
+    which is plain from its size,
+    and every column of the image lies on one wavelength scale of the first
+    order through it,
+    so the place on the detector of a window's reference column,
+    divided by its reference wavelength, gives the order of its wavelengths.
+    The window holds the line if its limits, in the first order,
+    hold the place on the detector of the line.
 
     Parameters
     ----------
@@ -186,74 +300,139 @@ def _window(
     cdelt = _number(header, "CDELT1")
     order_reference = 1 if cdelt > _dispersion_split else 2
     dispersion_first = cdelt * order_reference
-    position = float(typing.cast(float, wavelength.to_value(u.AA))) * order
+    column_reference = int(_number(header, "CRPIX1")) - 1
+    place_reference = _number(header, "CRVAL1") * order_reference
+    place = float(typing.cast(float, wavelength.to_value(u.AA))) * order
 
     if _text(header, "PIMGTYP") == "MULTIPLE":
         for n in range(1, int(_number(header, "ONUMIMG")) + 1):
-            minimum = _number(header, f"WAVEMIN{n}")
-            maximum = _number(header, f"WAVEMAX{n}")
-            for order_label in dict.fromkeys((order, 1)):
-                if minimum <= position / order_label <= maximum:
-                    break
-            else:
-                continue
-            dispersion = dispersion_first / order_label
-            reference = _number(header, f"WAVEL{n}")
-            offset = int(np.rint((reference - minimum) / dispersion))
-            return _Window(
-                start=int(_number(header, f"IREFPIX{n}")) - 1 - offset,
-                num=int(np.rint((maximum - minimum) / dispersion)),
-                wavelength=(reference - offset * dispersion) * order_label / order,
-                dispersion=dispersion_first / order,
+            column = int(_number(header, f"IREFPIX{n}")) - 1
+            label = _number(header, f"WAVEL{n}")
+            place_window = (
+                place_reference + (column - column_reference) * dispersion_first
             )
+            order_label = int(np.rint(place_window / label))
+            if order_label not in (1, 2):
+                continue
+            minimum = _number(header, f"WAVEMIN{n}") * order_label
+            maximum = _number(header, f"WAVEMAX{n}") * order_label
+            if minimum <= place <= maximum:
+                return _window_spanning(
+                    column=column,
+                    reference=label * order_label,
+                    minimum=minimum,
+                    maximum=maximum,
+                    dispersion_first=dispersion_first,
+                    order=order,
+                )
         return None
 
-    minimum = _number(header, "WAVEMIN")
-    maximum = _number(header, "WAVEMAX")
-    if not minimum <= position / order_reference <= maximum:
+    minimum = _number(header, "WAVEMIN") * order_reference
+    maximum = _number(header, "WAVEMAX") * order_reference
+    if not minimum <= place <= maximum:
         return None
-    dispersion = dispersion_first / order_reference
-    reference = _number(header, "CRVAL1")
-    offset = int(np.rint((reference - minimum) / dispersion))
-    return _Window(
-        start=int(_number(header, "CRPIX1")) - 1 - offset,
-        num=int(np.rint((maximum - minimum) / dispersion)),
-        wavelength=(reference - offset * dispersion) * order_reference / order,
-        dispersion=dispersion_first / order,
+    return _window_spanning(
+        column=column_reference,
+        reference=place_reference,
+        minimum=minimum,
+        maximum=maximum,
+        dispersion_first=dispersion_first,
+        order=order,
     )
 
 
-def _extent(data: np.ndarray, column: int) -> None | tuple[int, int]:
+def _extent(filled: np.ndarray, column: int) -> None | tuple[int, int]:
     """
     The first column, and the one after the last, of the run of columns of an
     image which hold data and include a given column,
-    or :obj:`None` if that column holds none.
+    or :obj:`None` if no run reaches it.
 
-    The columns which were not read out hold zeros.
+    Gaps of up to :data:`_gap_max` columns without data are bridged,
+    and a run reaches the column if it includes it or ends within that many
+    columns of it.
 
     Parameters
     ----------
-    data
-        The image, with the columns along its last axis.
+    filled
+        Whether each column holds data.
     column
-        The column the run must include.
+        The column the run must reach.
     """
-    filled = np.any(np.isfinite(data) & (data != 0), axis=0)
-    if not 0 <= column < filled.size or not filled[column]:
+    indices = np.flatnonzero(filled)
+    if not indices.size:
         return None
-    empty = np.flatnonzero(~filled)
-    lower = empty[empty < column]
-    upper = empty[empty > column]
-    first = int(lower[~0]) + 1 if lower.size else 0
-    last = int(upper[0]) if upper.size else filled.size
-    return first, last
+    breaks = np.flatnonzero(np.diff(indices) > _gap_max + 1)
+    starts = np.concatenate([indices[:1], indices[breaks + 1]])
+    stops = np.concatenate([indices[breaks], indices[~0:]]) + 1
+    for first, last in zip(starts, stops):
+        if first - _gap_max <= column < last + _gap_max:
+            return int(first), int(last)
+    return None
+
+
+def _exposure(
+    hdul: astropy.io.fits.HDUList,
+    time: astropy.time.Time,
+    window: _Window,
+    wavelength: u.Quantity,
+    order: int,
+) -> _Exposure:
+    """
+    The radiance of the run of read-out columns around a line in one
+    exposure, keeping none of the rest of its image.
+
+    Parameters
+    ----------
+    hdul
+        The FITS file of the exposure.
+    time
+        The start of the exposure.
+    window
+        The window which holds the line.
+    wavelength
+        The wavelength of the line.
+    order
+        The diffraction order of the line.
+
+    Raises
+    ------
+    ValueError
+        If the radiances are not in the unit of the level-1 files.
+    """
+    hdu = typing.cast(astropy.io.fits.PrimaryHDU, hdul[0])
+    header = hdu.header
+    if _text(header, "IMGUNITS") != _units_level1:
+        raise ValueError(f"Unexpected units {_text(header, 'IMGUNITS')!r}.")
+
+    image = np.asarray(hdu.data, dtype=float)
+    filled = np.any(np.isfinite(image) & (image != 0), axis=0)
+    column = window.column(float(typing.cast(float, wavelength.to_value(u.AA))))
+    extent = _extent(filled, column)
+    if extent is None:
+        return _Exposure(time, header, window, None, None)
+
+    columns = slice(*extent)
+    extension = typing.cast(astropy.io.fits.ImageHDU, hdul["SUMER-RAD-ARRAY"])
+    radiometry = np.asarray(extension.data, dtype=float)
+    row_order = int(_number(header, "RADORDER", 1)) - 1
+    factor = radiometry[order - 1, columns] / radiometry[row_order, columns]
+    radiance = image[:, columns] * factor
+    radiance[:, ~filled[columns]] = np.nan
+    return _Exposure(
+        time=time,
+        header=header,
+        window=window,
+        extent=(extent[0] - window.start, extent[1] - window.start),
+        radiance=radiance,
+    )
 
 
 def _centroid(
-    radiance: np.ndarray,
-    wavelengths: np.ndarray,
-    wavelength: float,
-) -> float:
+    radiance: na.AbstractScalarArray,
+    wavelengths: na.AbstractScalarArray,
+    wavelength: u.Quantity,
+    axis_wavelength: str,
+) -> u.Quantity:
     """
     The mean position of a line in some exposures:
     the centroid, above its lowest value, of their mean profile near its
@@ -262,41 +441,50 @@ def _centroid(
     Parameters
     ----------
     radiance
-        The spectra, with wavelength along the last axis.
+        The spectra.
     wavelengths
-        The edges of the columns, in angstroms.
+        The edges of the columns.
     wavelength
-        The wavelength of the line, in angstroms.
+        The wavelength of the line.
+    axis_wavelength
+        The logical axis corresponding to changes in wavelength.
 
     Raises
     ------
     ValueError
         If the spectra have no data near the wavelength of the line.
     """
+    # The mean over every axis but wavelength is a profile along wavelength
+    # alone, which is searched as a sequence.
+    axes = tuple(a for a in radiance.axes if a != axis_wavelength)
     with warnings.catch_warnings():
         # columns which no exposure read out have no mean
         warnings.simplefilter("ignore", RuntimeWarning)
-        profile = np.nanmean(radiance.reshape(-1, radiance.shape[~0]), axis=0)
-    centers = (wavelengths[1:] + wavelengths[:-1]) / 2
-    velocity = np.asarray(
-        u.Quantity(centers, u.AA).to_value(
-            u.km / u.s,
-            equivalencies=u.doppler_optical(wavelength * u.AA),
-        )
+        mean = _nanmean(radiance, axis=axes)
+    along = (axis_wavelength,)
+    profile = np.asarray(
+        typing.cast(u.Quantity, mean.ndarray_aligned(along)).to_value(_unit_radiance)
     )
-    search = _velocity_search.to_value(u.km / u.s)
-    candidates = np.isfinite(profile) & (np.abs(velocity) < search)
+    middles = typing.cast(na.ScalarArray, wavelengths.cell_centers(axis_wavelength))
+    centers = typing.cast(u.Quantity, middles.ndarray_aligned(along)).to(u.AA)
+    velocity = np.asarray(
+        centers.to_value(u.km / u.s, equivalencies=u.doppler_optical(wavelength))
+    )
+
+    finite = np.isfinite(profile)
+    candidates = finite & (np.abs(velocity) < _velocity_search.to_value(u.km / u.s))
     if not np.any(candidates):
         raise ValueError(
-            f"The spectra have no data within {_velocity_search} of {wavelength} A."
+            f"The spectra have no data within {_velocity_search} of {wavelength}."
         )
     peak = velocity[candidates][np.argmax(profile[candidates])]
+
     width = _velocity_centroid.to_value(u.km / u.s)
-    near = np.isfinite(profile) & (np.abs(velocity - peak) < width)
+    near = finite & (np.abs(velocity - peak) < width)
     excess = profile[near] - np.min(profile[near])
     if not np.sum(excess) > 0:
-        return float(centers[near][np.argmax(profile[near])])
-    return float(np.sum(excess * centers[near]) / np.sum(excess))
+        return u.Quantity(centers[near][np.argmax(profile[near])])
+    return u.Quantity(np.sum(excess * centers[near]) / np.sum(excess))
 
 
 def _vertices(centers: np.ndarray, width: float) -> np.ndarray:
@@ -304,6 +492,8 @@ def _vertices(centers: np.ndarray, width: float) -> np.ndarray:
     The edges between consecutive positions along a raster,
     halfway between them, with the outer edges as far beyond the first and
     last positions as the nearest edge is inside them.
+
+    A sequence which holds the slit still has every edge in one place.
 
     Parameters
     ----------
@@ -342,12 +532,15 @@ class SpectrographObservation(
     A sequence which sweeps the same field more than once
     goes back and forth along :attr:`axis_detector_x`,
     so select one sweep by its times to get a map of the field.
+    A sequence which holds the slit still (``RASTYPE = 'TEMPORAL'``)
+    has every edge along :attr:`axis_detector_x` in one place,
+    so it is a series in time rather than a map.
     The detector has more rows than a slit of 120 or 300 arcseconds lights,
     and the rows beyond the ends of the slit hold no signal.
 
-    The spectrum is that of the columns around the window which hold data in
+    The spectrum is that of the columns around the line which hold data in
     any exposure, and each exposure is not a number (NaN) in the columns
-    outside its own data,
+    outside its own data, and in its dead columns,
     so integrate over wavelength with :func:`numpy.nansum`.
     The windows of an image are the parts of the detector which were read out,
     and those around one line can lie side by side,
@@ -470,7 +663,8 @@ class SpectrographObservation(
             The time before which the exposures must start.
             If :obj:`None`, there is no latest start.
         timedelta
-            The exposure time of the exposures to keep.
+            The exposure time of the exposures to keep,
+            within a thousandth of it.
             If :obj:`None`, exposures of any length are kept.
         slit
             The slit of the exposures to keep, as the files name it.
@@ -496,6 +690,8 @@ class SpectrographObservation(
             If no exposure is kept,
             or if the kept exposures do not share one window, one detector,
             and one slit.
+        NotImplementedError
+            If the kept exposures are binned.
         """
         if isinstance(path, na.AbstractScalarArray):
             paths = [str(p) for p in np.asarray(path.ndarray).flat]
@@ -507,7 +703,7 @@ class SpectrographObservation(
         start = None if time_start is None else astropy.time.Time(time_start)
         stop = None if time_stop is None else astropy.time.Time(time_stop)
 
-        kept = []
+        exposures: list[_Exposure] = []
         for p in paths:
             for content in _members(p):
                 with warnings.catch_warnings():
@@ -518,99 +714,76 @@ class SpectrographObservation(
                 # Some exposures have a header but no image.
                 if header.get("NAXIS", 0) != 2:
                     continue
-                time = astropy.time.Time(header["DATE_OBS"])
+                time = astropy.time.Time(_text(header, "DATE_OBS"))
                 if start is not None and time < start:
                     continue
                 if stop is not None and not time < stop:
                     continue
-                if timedelta is not None and header["EXPTIME"] * u.s != timedelta:
-                    continue
-                if slit is not None and header["SLIT"] != slit:
+                if timedelta is not None:
+                    exposure = _number(header, "EXPTIME") * u.s
+                    if abs(exposure - timedelta) > _tolerance_timedelta * timedelta:
+                        continue
+                if slit is not None and _text(header, "SLIT") != slit.strip():
                     continue
                 window = _window(header, wavelength, order)
                 if window is None:
                     continue
-                kept.append((time, header, window, hdul))
+                if (_number(header, "BINX", 1), _number(header, "BINY", 1)) != (1, 1):
+                    raise NotImplementedError("Binned exposures are not supported yet.")
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message=_message_ascii)
+                    exposures.append(_exposure(hdul, time, window, wavelength, order))
 
-        if not kept:
+        if not exposures:
             raise ValueError(
                 f"No exposure in {paths} has a window holding {wavelength}"
                 " which matches the selection."
             )
 
-        kept.sort(key=lambda k: k[0].jd)
-        times, headers, windows, hduls = zip(*kept)
+        exposures.sort(key=lambda e: float(typing.cast(float, e.time.jd)))
+        headers = [e.header for e in exposures]
+        windows = [e.window for e in exposures]
 
         window = windows[0]
         for w in windows:
-            num = w.num != window.num
-            shift = abs(w.wavelength - window.wavelength) / window.dispersion
-            stretch = abs(w.dispersion - window.dispersion) * window.num
-            if (
-                num
-                or shift > _tolerance_window
-                or stretch > _tolerance_window * window.dispersion
-            ):
+            num = abs(w.num - window.num) > 1
+            shift = abs(w.middle - window.middle) / window.dispersion
+            stretch = abs(w.dispersion / window.dispersion - 1)
+            if num or shift > _tolerance_window or stretch > _tolerance_dispersion:
                 raise ValueError(
                     f"The exposures differ in their window, {window} and {w}; "
                     "select one sequence with the time range, `timedelta`, or `slit`."
                 )
 
         for key, values in (
-            ("detector", [h["DETECTOR"].strip() for h in headers]),
-            ("slit", [h["SLIT"] for h in headers]),
-            ("number of rows", [h["NAXIS2"] for h in headers]),
-            ("binning", [(h.get("BINX", 1), h.get("BINY", 1)) for h in headers]),
+            ("detector", [_text(h, "DETECTOR") for h in headers]),
+            ("slit", [_text(h, "SLIT") for h in headers]),
+            ("number of rows", [_number(h, "NAXIS2") for h in headers]),
+            ("pixel size along the slit", [_number(h, "CDELT2") for h in headers]),
         ):
             if len(set(values)) > 1:
                 raise ValueError(
                     f"The exposures differ in their {key}, {sorted(set(map(str, values)))}; "
                     "select one sequence with the time range, `timedelta`, or `slit`."
                 )
-
         header = headers[0]
-        if (header.get("BINX", 1), header.get("BINY", 1)) != (1, 1):
-            raise NotImplementedError("Binned exposures are not supported yet.")
 
-        # The columns around the window which hold data in any exposure,
+        # The columns around the line which hold data in any exposure,
         # counted from the start of the window.
-        # The windows of an image are the parts of the detector which were
-        # read out, so the data around one can reach a few columns past the
-        # limits its header gives, or fall a few short of them,
-        # and run on into a neighbouring window.
-        # Where they end moves by a column or two from one exposure to the
-        # next, so each exposure is unobserved, NaN, outside its own run.
-        extents = []
-        for hdul, w in zip(hduls, windows):
-            data = np.asarray(typing.cast(astropy.io.fits.PrimaryHDU, hdul[0]).data)
-            extent = _extent(data, w.start + w.num // 2)
-            if extent is not None:
-                extent = (extent[0] - w.start, extent[1] - w.start)
-            extents.append(extent)
-        found = [e for e in extents if e is not None]
-        lower = min(e[0] for e in found) if found else 0
-        upper = max(e[1] for e in found) if found else window.num
-        num = upper - lower
-
-        radiance = []
-        for h, hdul, w, extent in zip(headers, hduls, windows, extents):
-            if h.get("IMGUNITS", "").strip() != "W/sr/m^2/Angstroem":
-                raise ValueError(f"Unexpected units {h.get('IMGUNITS')!r}.")
-            # A sequence can mix images of one window with images of
-            # several, which hold the same window in other columns.
-            image = np.asarray(hdul[0].data, dtype=float)
-            radiometry = np.asarray(hdul["SUMER-RAD-ARRAY"].data, dtype=float)
-            row_order = int(h.get("RADORDER", 1)) - 1
-            data = np.full((image.shape[0], num), np.nan)
-            if extent is not None:
-                columns = slice(w.start + extent[0], w.start + extent[1])
-                factor = radiometry[order - 1, columns] / radiometry[row_order, columns]
-                index = slice(extent[0] - lower, extent[1] - lower)
-                data[:, index] = image[:, columns] * factor
-            radiance.append(data)
+        # A sequence can mix images of one window with images of several,
+        # which hold the same window in other columns.
+        extents = [e.extent for e in exposures if e.extent is not None]
+        lower = min(e[0] for e in extents) if extents else 0
+        upper = max(e[1] for e in extents) if extents else window.num
+        num_row = int(_number(header, "NAXIS2"))
+        radiance = np.full((len(exposures), num_row, upper - lower), np.nan)
+        for i, e in enumerate(exposures):
+            if e.extent is not None and e.radiance is not None:
+                index = slice(e.extent[0] - lower, e.extent[1] - lower)
+                radiance[i, :, index] = e.radiance
 
         outputs = na.ScalarArray(
-            ndarray=np.stack(radiance) << _unit_radiance,
+            ndarray=radiance << _unit_radiance,
             axes=(axis_detector_x, axis_detector_y, axis_wavelength),
         )
 
@@ -618,39 +791,34 @@ class SpectrographObservation(
         # which differ by much less than a column.
         wavelength_first = np.median([w.wavelength for w in windows])
         dispersion = np.median([w.dispersion for w in windows])
-        index_column = lower + np.arange(num + 1) - 0.5
-        wavelengths = (wavelength_first + index_column * dispersion) * u.AA
+        index_column = lower + np.arange(upper - lower + 1) - 0.5
+        wavelengths = na.ScalarArray(
+            ndarray=(wavelength_first + index_column * dispersion) << u.AA,
+            axes=axis_wavelength,
+        )
 
         rest = wavelength.to(u.AA)
         if velocity_zero is None:
-            shift = 0 * u.AA
+            shift = u.Quantity(0, u.AA)
         elif isinstance(velocity_zero, str):
             if velocity_zero != "mean":
                 raise ValueError(f"{velocity_zero=} not recognized.")
-            centroid = _centroid(
-                radiance=np.stack(radiance),
-                wavelengths=wavelengths.to_value(u.AA),
-                wavelength=rest.value,
-            )
-            shift = centroid * u.AA - rest
+            centroid = _centroid(outputs, wavelengths, rest, axis_wavelength)
+            shift = u.Quantity(centroid - rest)
         else:
             zero = velocity_zero.to(u.AA, equivalencies=u.doppler_optical(rest))
-            shift = zero - rest
+            shift = u.Quantity(zero - rest)
         wavelengths = wavelengths - shift
 
-        num_row = header["NAXIS2"]
         index_row = np.arange(num_row + 1) + 0.5
-        cdelt2 = np.array([h["CDELT2"] for h in headers])
-        if np.any(cdelt2 != cdelt2[0]):
-            raise ValueError("The exposures differ in their pixel size along the slit.")
-        offset_y = (index_row - header["CRPIX2"]) * cdelt2[0]
+        offset_y = (index_row - _number(header, "CRPIX2")) * _number(header, "CDELT2")
 
-        width = header.get("IXWIDTH", 0)
-        x = _vertices(np.array([h["CRVAL3"] for h in headers]), width)
-        y = _vertices(np.array([h["CRVAL2"] for h in headers]), 0)
+        width = _number(header, "IXWIDTH")
+        x = _vertices(np.array([_number(h, "CRVAL3") for h in headers]), width)
+        y = _vertices(np.array([_number(h, "CRVAL2") for h in headers]), 0)
 
         time_vertices = astropy.time.Time(
-            [t.isot for t in times] + [headers[~0]["DATE_END"]],
+            [e.time.isot for e in exposures] + [_text(headers[~0], "DATE_END")],
         )
 
         inputs = na.TemporalDopplerPositionalVectorArray(
@@ -658,7 +826,7 @@ class SpectrographObservation(
                 typing.cast(np.ndarray, time_vertices),
                 axes=axis_detector_x,
             ),
-            wavelength=na.ScalarArray(wavelengths, axes=axis_wavelength),
+            wavelength=wavelengths,
             wavelength_rest=wavelength,
             position=na.Cartesian2dVectorArray(
                 x=na.ScalarArray(x << u.arcsec, axes=axis_detector_x),
@@ -671,13 +839,13 @@ class SpectrographObservation(
             inputs=inputs,
             outputs=outputs,
             timedelta=na.ScalarArray(
-                np.array([h["EXPTIME"] for h in headers]) << u.s,
+                np.array([_number(h, "EXPTIME") for h in headers]) << u.s,
                 axes=axis_detector_x,
             ),
             order=order,
-            detector=header["DETECTOR"].strip(),
+            detector=_text(header, "DETECTOR"),
+            slit=_text(header, "SLIT"),
             shift_wavelength=shift,
-            slit=header["SLIT"],
             axis_wavelength=axis_wavelength,
             axis_detector_x=axis_detector_x,
             axis_detector_y=axis_detector_y,
@@ -716,7 +884,8 @@ class SpectrographObservation(
         order
             The diffraction order in which the window observed `wavelength`.
         timedelta
-            The exposure time of the exposures to keep.
+            The exposure time of the exposures to keep,
+            within a thousandth of it.
             If :obj:`None`, exposures of any length are kept.
         slit
             The slit of the exposures to keep, as the files name it.
@@ -777,7 +946,7 @@ class SpectrographObservation(
         cbar_fraction: float = 0.1,
     ) -> matplotlib.axes.Axes:
         """
-        Display the exposures as a false-color image,
+        Display the exposures of a raster as a false-color image,
         whose hue is the Doppler velocity
         and whose brightness is the radiance,
         as :meth:`iris.sg.SpectrographObservation.show` does.
@@ -800,7 +969,8 @@ class SpectrographObservation(
             If :obj:`None`, zero is used.
         vmax
             The maximum value of the data range.
-            If :obj:`None`, the 99.5th percentile of each wavelength is used.
+            If :obj:`None`, the 99.5th percentile of each wavelength is used,
+            or the largest of them for a wavelength with no data.
         velocity_min
             The minimum Doppler velocity of the data range.
         velocity_max
@@ -808,16 +978,28 @@ class SpectrographObservation(
         cbar_fraction
             The fraction of the space to use for the colorbar axes if `cax`
             is :obj:`None`.
+
+        Raises
+        ------
+        ValueError
+            If the slit stood still between two exposures,
+            as in a sequence which is a series in time rather than a raster.
         """
+        axis_wavelength = self.axis_wavelength
+        axis_x = self.axis_detector_x
+        axis_y = self.axis_detector_y
+
+        step = _diff(self.inputs.position.x, axis=axis_x)
+        if np.any(step == 0 * u.arcsec):
+            raise ValueError(
+                "The slit stood still between exposures, so they are not a raster."
+            )
+
         outputs = self.outputs.copy()
         outputs[~np.isfinite(outputs)] = 0 * _unit_radiance
 
         wavelength_rest = na.as_named_array(self.inputs.wavelength_rest)
         wavelength_center = typing.cast(na.AbstractScalarArray, wavelength_rest).ndarray
-
-        axis_wavelength = self.axis_wavelength
-        axis_x = self.axis_detector_x
-        axis_y = self.axis_detector_y
 
         if ax is None:
             fig, ax = plt.subplots(
@@ -839,9 +1021,16 @@ class SpectrographObservation(
             vmin = 0 * _unit_radiance
 
         if vmax is None:
-            # named-arrays takes the names of axes where numpy takes numbers
-            percentile = typing.cast(Callable[..., na.AbstractScalar], np.nanpercentile)
-            vmax = percentile(outputs, q=99.5, axis=(axis_x, axis_y))
+            percentile = _nanpercentile(outputs, q=99.5, axis=(axis_x, axis_y))
+            # A wavelength with no data would be scaled by zero.
+            zero = u.Quantity(0, _unit_radiance)
+            largest = typing.cast(u.Quantity, percentile.ndarray).max()
+            if not largest > zero:
+                largest = u.Quantity(1, _unit_radiance)
+            vmax = _where(percentile > zero, percentile, largest)
+
+        # The velocities of the inputs are optical, c (w / w0 - 1).
+        equivalencies = u.doppler_optical(wavelength_center)
 
         # Recent versions of astropy annotate what quantity_support returns as
         # something which cannot be used in a with statement, though it can.
@@ -866,10 +1055,7 @@ class SpectrographObservation(
             )
             na.plt.pcolormesh(
                 colorbar.inputs.x,
-                colorbar.inputs.y.to(
-                    u.AA,
-                    equivalencies=u.doppler_radio(wavelength_center),
-                ),
+                colorbar.inputs.y.to(u.AA, equivalencies=equivalencies),
                 C=colorbar.outputs,
                 axis_rgb=axis_wavelength,
                 ax=cax,
@@ -889,7 +1075,6 @@ class SpectrographObservation(
             ax.set_ylabel(f"helioprojective $y$ ({ax.get_ylabel()})")
             # The limits are quantities,
             # which the support for quantities above lets matplotlib take.
-            equivalencies = u.doppler_radio(wavelength_center)
             wavelength_min = velocity_min.to(u.AA, equivalencies=equivalencies)
             wavelength_max = velocity_max.to(u.AA, equivalencies=equivalencies)
             cax.set_ylim(
