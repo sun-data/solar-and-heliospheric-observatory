@@ -15,6 +15,7 @@ jupyter_execute/
 
 # Written by pytest and by the coverage step of the test workflow
 .pytest_cache/
+.soho-test-downloads/
 .coverage
 coverage.xml
 
