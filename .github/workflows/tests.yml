@@ -30,9 +30,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install setuptools wheel
           pip install -e .[test]
+      # The files of the SOHO archive never change, so the ones the tests
+      # download are kept from one run to the next.
+      - name: Restore the files the tests download
+        uses: actions/cache@v4
+        with:
+          path: .soho-test-downloads
+          key: soho-test-downloads-${{ runner.os }}-v1
       - name: Test with pytest
         env:
           MPLBACKEND: "agg"
+          SOHO_TEST_DOWNLOADS: .soho-test-downloads
         run: |
           pip install pytest pytest-cov
           pytest --cov=. --cov-report=xml
