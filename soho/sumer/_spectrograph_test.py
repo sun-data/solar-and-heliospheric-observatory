@@ -1,6 +1,8 @@
 import pathlib
 import pytest
 import numpy as np
+import matplotlib.axes
+import matplotlib.pyplot as plt
 import astropy.units as u
 import astropy.time
 import astropy.io.fits
@@ -223,6 +225,16 @@ class TestSpectrographObservation:
                 wavelength=1548.2 * u.AA,
                 order=1,
             )
+
+    def test_show(self, path_test: pathlib.Path):
+        result = soho.sumer.SpectrographObservation.from_level1(
+            path=path_test,
+            wavelength=_wavelength,
+            order=2,
+        )
+        ax = result.show()
+        assert isinstance(ax, matplotlib.axes.Axes)
+        plt.close(ax.figure)
 
     def test_from_level1_timedelta(self, path_test: pathlib.Path):
         with pytest.raises(ValueError, match="No exposure"):

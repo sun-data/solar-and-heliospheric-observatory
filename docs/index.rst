@@ -39,49 +39,30 @@ API Reference
 Examples
 ========
 
-Load the quiet-Sun raster of O V 629.7 angstroms which SUMER observed on
-1996 September 16, in the second order of its grating,
-and display its radiance.
-The dark bands above and below are the rows of the detector beyond the ends
-of the slit.
+Load the raster of a prominence above the northwest limb which SUMER observed
+on 1996 April 10 in N V 1242.8 angstroms, in the first order of its grating,
+and display it as a false-color image,
+whose hue is the Doppler velocity and whose brightness is the radiance.
 
 .. jupyter-execute::
 
-    import numpy as np
-    import matplotlib
-    import matplotlib.pyplot as plt
     import astropy.units as u
-    import astropy.visualization
-    import named_arrays as na
     import soho
 
-    # Download the raster and load the window of O V into memory
+    # Download the raster and load the window of N V into memory
     obs = soho.sumer.open(
-        time_start="1996-09-16T16:07",
-        time_stop="1996-09-16T22:49",
-        wavelength=629.73 * u.AA,
-        order=2,
+        time_start="1996-04-10T08:04",
+        time_stop="1996-04-10T12:11",
+        wavelength=1242.80 * u.AA,
+        order=1,
     )
 
-    # Integrate over the line, leaving out the columns which an exposure
-    # did not read out
-    dw = obs.inputs.wavelength.volume_cell(obs.axis_wavelength)
-    radiance = np.nansum(obs.outputs * dw, axis=obs.axis_wavelength)
-
-    # Display the radiance
-    with astropy.visualization.quantity_support():
-        fig, ax = plt.subplots(figsize=(6, 6), constrained_layout=True)
-        img = na.plt.pcolormesh(
-            obs.inputs.position.x,
-            obs.inputs.position.y,
-            C=radiance,
-            ax=ax,
-            cmap="gray",
-            norm=matplotlib.colors.PowerNorm(0.5),
-        )
-        ax.set_aspect("equal")
-        ax.set_xlabel(f"helioprojective $x$ ({ax.get_xlabel()})")
-        ax.set_ylabel(f"helioprojective $y$ ({ax.get_ylabel()})")
+    # Display the prominence
+    ax = obs.show(
+        velocity_min=-60 * u.km / u.s,
+        velocity_max=+60 * u.km / u.s,
+    )
+    ax.set_ylim(570, 790);
 
 References
 ==========

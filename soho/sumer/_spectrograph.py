@@ -1,4 +1,4 @@
-from typing import Iterator, Sequence
+from typing import Callable, Iterator, Sequence
 import typing
 import io
 import os
@@ -7,9 +7,13 @@ import tarfile
 import warnings
 import dataclasses
 import numpy as np
+import matplotlib.axes
+import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 import astropy.units as u
 import astropy.time
 import astropy.io.fits
+import astropy.visualization
 import named_arrays as na
 from ._data import urls, download
 
@@ -643,3 +647,135 @@ class SpectrographObservation(
             axis_detector_x=axis_detector_x,
             axis_detector_y=axis_detector_y,
         )
+
+    def show(
+        self,
+        ax: None | matplotlib.axes.Axes = None,
+        cax: None | matplotlib.axes.Axes = None,
+        norm: None | Callable = None,
+        vmin: None | float | u.Quantity | na.AbstractScalar = None,
+        vmax: None | float | u.Quantity | na.AbstractScalar = None,
+        velocity_min: u.Quantity = -100 * u.km / u.s,
+        velocity_max: u.Quantity = +100 * u.km / u.s,
+        cbar_fraction: float = 0.1,
+    ) -> matplotlib.axes.Axes:
+        """
+        Display the exposures as a false-color image,
+        whose hue is the Doppler velocity
+        and whose brightness is the radiance,
+        as :meth:`iris.sg.SpectrographObservation.show` does.
+
+        Columns which an exposure did not read out are shown as zero.
+
+        Parameters
+        ----------
+        ax
+            The :mod:`matplotlib` axes on which to plot the image.
+            If :obj:`None`, a new figure is created.
+        cax
+            The axes on which to plot the colorbar.
+            If :obj:`None`, space is stolen from `ax` to create a new set of axes.
+        norm
+            The normalization method used to scale data into the range [0, 1]
+            before mapping to colors.
+        vmin
+            The minimum value of the data range.
+            If :obj:`None`, zero is used.
+        vmax
+            The maximum value of the data range.
+            If :obj:`None`, the 99.5th percentile of each wavelength is used.
+        velocity_min
+            The minimum Doppler velocity of the data range.
+        velocity_max
+            The maximum Doppler velocity of the data range.
+        cbar_fraction
+            The fraction of the space to use for the colorbar axes if `cax`
+            is :obj:`None`.
+        """
+        outputs = self.outputs.copy()
+        outputs[~np.isfinite(outputs)] = 0 * _unit_radiance
+
+        wavelength_rest = na.as_named_array(self.inputs.wavelength_rest)
+        wavelength_center = typing.cast(na.AbstractScalarArray, wavelength_rest).ndarray
+
+        axis_wavelength = self.axis_wavelength
+        axis_x = self.axis_detector_x
+        axis_y = self.axis_detector_y
+
+        if ax is None:
+            fig, ax = plt.subplots(
+                figsize=(8, 8),
+                constrained_layout=True,
+            )
+        ax = typing.cast(matplotlib.axes.Axes, ax)
+
+        if cax is None:
+            divider = make_axes_locatable(ax)
+            cax = divider.append_axes(
+                position="right",
+                size=f"{cbar_fraction * 100}%",
+                pad=1,
+            )
+        cax = typing.cast(matplotlib.axes.Axes, cax)
+
+        if vmin is None:
+            vmin = 0 * _unit_radiance
+
+        if vmax is None:
+            # named-arrays takes the names of axes where numpy takes numbers
+            percentile = typing.cast(Callable[..., na.AbstractScalar], np.nanpercentile)
+            vmax = percentile(outputs, q=99.5, axis=(axis_x, axis_y))
+
+        with astropy.visualization.quantity_support():
+            cax_twin = cax.twinx()
+            colorbar = na.plt.rgbmesh(
+                self.inputs.velocity,
+                self.inputs.position.x,
+                self.inputs.position.y,
+                C=outputs,
+                axis_wavelength=axis_wavelength,
+                ax=ax,
+                vmin=vmin,
+                vmax=vmax,
+                norm=norm,
+                wavelength_min=velocity_min,
+                wavelength_max=velocity_max,
+            )
+            na.plt.pcolormesh(
+                colorbar.inputs.x,
+                colorbar.inputs.y.to(
+                    u.AA,
+                    equivalencies=u.doppler_radio(wavelength_center),
+                ),
+                C=colorbar.outputs,
+                axis_rgb=axis_wavelength,
+                ax=cax,
+            )
+            na.plt.pcolormesh(
+                C=colorbar,
+                axis_rgb=axis_wavelength,
+                ax=cax_twin,
+            )
+
+            time = typing.cast(
+                np.ndarray, astropy.time.Time(self.inputs.time.ndarray).isot
+            )
+            ax.set_title(f"{time[0]} to {time[~0]}")
+            ax.set_aspect("equal")
+            ax.set_xlabel(f"helioprojective $x$ ({ax.get_xlabel()})")
+            ax.set_ylabel(f"helioprojective $y$ ({ax.get_ylabel()})")
+            # The limits are quantities,
+            # which the support for quantities above lets matplotlib take.
+            equivalencies = u.doppler_radio(wavelength_center)
+            wavelength_min = velocity_min.to(u.AA, equivalencies=equivalencies)
+            wavelength_max = velocity_max.to(u.AA, equivalencies=equivalencies)
+            cax.set_ylim(
+                typing.cast(float, wavelength_min),
+                typing.cast(float, wavelength_max),
+            )
+            cax_twin.set_ylim(
+                typing.cast(float, velocity_min),
+                typing.cast(float, velocity_max),
+            )
+
+        return ax
