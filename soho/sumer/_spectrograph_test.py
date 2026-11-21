@@ -8,7 +8,9 @@ import astropy.units as u
 import astropy.time
 import astropy.io.fits
 import soho
+import named_arrays as na
 from soho.sumer._spectrograph import _window, _extent, _vertices
+from soho.sumer._spectrograph import _centroid, _unit_radiance
 
 _wavelength = 629.73 * u.AA
 """The wavelength of O V."""
@@ -228,6 +230,44 @@ def test_vertices(
     expected: np.ndarray,
 ):
     assert np.allclose(_vertices(centers, width), expected)
+
+
+@pytest.mark.parametrize(
+    argnames="offset,offset_other,height_other",
+    argvalues=[
+        # the line where the files put it, and a weaker one nearby
+        (0, 17, 0.2),
+        # the line 17 columns from where the files put it,
+        # and a weaker line there, as in some files of 2005 and 2007
+        (-17, 0, 0.2),
+        (17, 0, 0.2),
+        # a brighter line beyond the search is not taken for the line
+        (0, 30, 2),
+        (0, -30, 2),
+    ],
+)
+def test_centroid(
+    offset: int,
+    offset_other: int,
+    height_other: float,
+):
+    """The line is found where it is, not where the files put it."""
+    dispersion = 0.0215 * u.AA
+    num = 101
+    axis = "wavelength"
+    index = na.arange(0, num + 1, axis=axis)
+    wavelengths = _wavelength + (index - num / 2) * dispersion
+    column = (wavelengths.cell_centers(axis) - _wavelength) / dispersion
+    column = column.to(u.dimensionless_unscaled).value
+    line = np.exp(-np.square((column - offset) / 2.4) / 2)
+    other = height_other * np.exp(-np.square((column - offset_other) / 1.7) / 2)
+    exposures = na.ScalarArray(np.ones(3), axes=("detector_x",))
+    radiance = (line + other + 0.05) * exposures * _unit_radiance
+
+    result = _centroid(radiance, wavelengths, _wavelength, axis)
+
+    expected = _wavelength + offset * dispersion
+    assert np.isclose(result, expected, rtol=0, atol=1e-3 * dispersion)
 
 
 class TestSpectrographObservation:

@@ -72,13 +72,19 @@ to be kept, since the files give, for example, 100.01 s for some exposures of
 a sequence of 100 s.
 """
 
-_velocity_search = u.Quantity(100, u.km / u.s)
+_num_column_search = 20
 """
-How far from the wavelength of the line the brightest part of the mean
-profile is looked for, when the line is zeroed on its mean position.
+How far from the wavelength of the line, in columns of the detector,
+the brightest part of the mean profile is looked for,
+when the line is zeroed on its mean position.
 
-SUMER's wavelength scale is off by up to about 50 km/s, and the limit keeps a
-brighter line which shares the window from being taken for the line.
+The wavelength scale of most files is right to within a few columns,
+but that of some is off by as much as 17 columns:
+O V 629.7 Angstroms is 15 to 17 columns from where the files put it
+in rasters of 2005 May and October and of 2007 November.
+The limit keeps a brighter line elsewhere in the image,
+such as Si II 1265.0 Angstroms in an image of the whole detector,
+from being taken for the line.
 """
 
 _velocity_centroid = u.Quantity(100, u.km / u.s)
@@ -437,7 +443,8 @@ def _centroid(
     """
     The mean position of a line in some exposures:
     the centroid, above its lowest value, of their mean profile near its
-    brightest part, which is looked for near the wavelength of the line.
+    brightest part, which is looked for within :data:`_num_column_search`
+    columns of the wavelength of the line.
 
     Parameters
     ----------
@@ -473,10 +480,13 @@ def _centroid(
     )
 
     finite = np.isfinite(profile)
-    candidates = finite & (np.abs(velocity) < _velocity_search.to_value(u.km / u.s))
+    column = np.abs(np.diff(centers.value)).mean()
+    reach = _num_column_search * column
+    candidates = finite & (np.abs(centers.value - wavelength.to_value(u.AA)) < reach)
     if not np.any(candidates):
         raise ValueError(
-            f"The spectra have no data within {_velocity_search} of {wavelength}."
+            f"The spectra have no data within {_num_column_search} columns "
+            f"of {wavelength}."
         )
     peak = velocity[candidates][np.argmax(profile[candidates])]
 
@@ -674,7 +684,9 @@ class SpectrographObservation(
             Where to put the zero of the Doppler velocity,
             since SUMER has no absolute wavelength scale.
             If ``"mean"`` (the default), the wavelengths are shifted to put the
-            mean position of the line in the kept exposures at `wavelength`.
+            mean position of the line in the kept exposures at `wavelength`,
+            the line being the brightest part of their mean profile within
+            20 columns of where the files put it.
             If a velocity, they are shifted to put that velocity,
             on the scale the files give, at `wavelength`.
             If :obj:`None`, the wavelengths are those the files give.
@@ -895,7 +907,9 @@ class SpectrographObservation(
             Where to put the zero of the Doppler velocity,
             since SUMER has no absolute wavelength scale.
             If ``"mean"`` (the default), the wavelengths are shifted to put the
-            mean position of the line in the kept exposures at `wavelength`.
+            mean position of the line in the kept exposures at `wavelength`,
+            the line being the brightest part of their mean profile within
+            20 columns of where the files put it.
             If a velocity, they are shifted to put that velocity,
             on the scale the files give, at `wavelength`.
             If :obj:`None`, the wavelengths are those the files give.
