@@ -72,18 +72,15 @@ to be kept, since the files give, for example, 100.01 s for some exposures of
 a sequence of 100 s.
 """
 
-_num_column_search = 20
+_velocity_search = u.Quantity(100, u.km / u.s)
 """
-How far from the wavelength of the line, in columns of the detector,
-the brightest part of the mean profile is looked for,
-when the line is zeroed on its mean position.
+How far from the wavelength of the line the brightest part of the mean
+profile is looked for by default, when the line is zeroed on its mean position.
 
-The wavelength scale of most files is right to within a few columns,
-but that of some is off by as much as 17 columns:
-O V 629.7 Angstroms is 15 to 17 columns from where the files put it
-in rasters of 2005 May and October and of 2007 November.
-The limit keeps a brighter line elsewhere in the image,
-such as Si II 1265.0 Angstroms in an image of the whole detector,
+The wavelength scale of most files is right to within a few columns of the
+detector, tens of kilometers per second,
+and the limit keeps a brighter line which shares the window,
+such as N V 1242.8 angstroms, 18 columns from Fe XII 1242.0 angstroms,
 from being taken for the line.
 """
 
@@ -439,12 +436,12 @@ def _centroid(
     wavelengths: na.AbstractScalarArray,
     wavelength: u.Quantity,
     axis_wavelength: str,
+    velocity_search: u.Quantity = _velocity_search,
 ) -> u.Quantity:
     """
     The mean position of a line in some exposures:
     the centroid, above its lowest value, of their mean profile near its
-    brightest part, which is looked for within :data:`_num_column_search`
-    columns of the wavelength of the line.
+    brightest part, which is looked for near the wavelength of the line.
 
     Parameters
     ----------
@@ -456,6 +453,9 @@ def _centroid(
         The wavelength of the line.
     axis_wavelength
         The logical axis corresponding to changes in wavelength.
+    velocity_search
+        How far from `wavelength` the brightest part of the profile is
+        looked for.
 
     Raises
     ------
@@ -480,13 +480,11 @@ def _centroid(
     )
 
     finite = np.isfinite(profile)
-    column = np.abs(np.diff(centers.value)).mean()
-    reach = _num_column_search * column
-    candidates = finite & (np.abs(centers.value - wavelength.to_value(u.AA)) < reach)
+    reach = velocity_search.to_value(u.km / u.s)
+    candidates = finite & (np.abs(velocity) < reach)
     if not np.any(candidates):
         raise ValueError(
-            f"The spectra have no data within {_num_column_search} columns "
-            f"of {wavelength}."
+            f"The spectra have no data within {velocity_search} of {wavelength}."
         )
     peak = velocity[candidates][np.argmax(profile[candidates])]
 
@@ -573,8 +571,9 @@ class SpectrographObservation(
 
     SUMER has no absolute wavelength scale:
     the files place the wavelength a window was planned for at a reference
-    column, and the line can lie several columns from it,
-    tens of kilometers per second in Doppler velocity.
+    column, and the line usually lies within a few columns of it,
+    tens of kilometers per second in Doppler velocity,
+    but in some files as much as 17 columns from it.
     So by default the wavelengths are shifted to put the mean position of the
     line in the loaded exposures at its rest wavelength,
     which removes any real net shift of the region too,
@@ -639,6 +638,7 @@ class SpectrographObservation(
         timedelta: None | u.Quantity = None,
         slit: None | str = None,
         velocity_zero: None | Literal["mean"] | u.Quantity = "mean",
+        velocity_search: u.Quantity = _velocity_search,
         axis_wavelength: str = "wavelength",
         axis_detector_x: str = "detector_x",
         axis_detector_y: str = "detector_y",
@@ -686,10 +686,21 @@ class SpectrographObservation(
             If ``"mean"`` (the default), the wavelengths are shifted to put the
             mean position of the line in the kept exposures at `wavelength`,
             the line being the brightest part of their mean profile within
-            20 columns of where the files put it.
+            `velocity_search` of where the files put it.
             If a velocity, they are shifted to put that velocity,
             on the scale the files give, at `wavelength`.
             If :obj:`None`, the wavelengths are those the files give.
+        velocity_search
+            How far from where the files put `wavelength` the line is looked
+            for, if `velocity_zero` is ``"mean"``.
+            The default, 100 kilometers per second, is enough for most files,
+            but some are off by as much as 17 columns,
+            such as some of the rasters of O V 629.7 angstroms of 1996, 2005,
+            and 2007, which need about 200 kilometers per second.
+            A wider search reaches more of the other lines in the window,
+            and takes one which is brighter for the line,
+            as it would take N V 1242.8 angstroms, 18 columns away,
+            for Fe XII 1242.0 angstroms.
         axis_wavelength
             The logical axis corresponding to changes in wavelength.
         axis_detector_x
@@ -816,7 +827,13 @@ class SpectrographObservation(
         elif isinstance(velocity_zero, str):
             if velocity_zero != "mean":
                 raise ValueError(f"{velocity_zero=} not recognized.")
-            centroid = _centroid(outputs, wavelengths, rest, axis_wavelength)
+            centroid = _centroid(
+                radiance=outputs,
+                wavelengths=wavelengths,
+                wavelength=rest,
+                axis_wavelength=axis_wavelength,
+                velocity_search=velocity_search,
+            )
             shift = u.Quantity(centroid - rest)
         else:
             zero = velocity_zero.to(u.AA, equivalencies=u.doppler_optical(rest))
@@ -874,6 +891,7 @@ class SpectrographObservation(
         timedelta: None | u.Quantity = None,
         slit: None | str = None,
         velocity_zero: None | Literal["mean"] | u.Quantity = "mean",
+        velocity_search: u.Quantity = _velocity_search,
         axis_wavelength: str = "wavelength",
         axis_detector_x: str = "detector_x",
         axis_detector_y: str = "detector_y",
@@ -909,10 +927,21 @@ class SpectrographObservation(
             If ``"mean"`` (the default), the wavelengths are shifted to put the
             mean position of the line in the kept exposures at `wavelength`,
             the line being the brightest part of their mean profile within
-            20 columns of where the files put it.
+            `velocity_search` of where the files put it.
             If a velocity, they are shifted to put that velocity,
             on the scale the files give, at `wavelength`.
             If :obj:`None`, the wavelengths are those the files give.
+        velocity_search
+            How far from where the files put `wavelength` the line is looked
+            for, if `velocity_zero` is ``"mean"``.
+            The default, 100 kilometers per second, is enough for most files,
+            but some are off by as much as 17 columns,
+            such as some of the rasters of O V 629.7 angstroms of 1996, 2005,
+            and 2007, which need about 200 kilometers per second.
+            A wider search reaches more of the other lines in the window,
+            and takes one which is brighter for the line,
+            as it would take N V 1242.8 angstroms, 18 columns away,
+            for Fe XII 1242.0 angstroms.
         axis_wavelength
             The logical axis corresponding to changes in wavelength.
         axis_detector_x
@@ -944,6 +973,7 @@ class SpectrographObservation(
             timedelta=timedelta,
             slit=slit,
             velocity_zero=velocity_zero,
+            velocity_search=velocity_search,
             axis_wavelength=axis_wavelength,
             axis_detector_x=axis_detector_x,
             axis_detector_y=axis_detector_y,
