@@ -8,7 +8,9 @@ import astropy.units as u
 import astropy.time
 import astropy.io.fits
 import soho
+import named_arrays as na
 from soho.sumer._spectrograph import _window, _extent, _vertices
+from soho.sumer._spectrograph import _centroid, _unit_radiance
 
 _wavelength = 629.73 * u.AA
 """The wavelength of O V."""
@@ -230,6 +232,54 @@ def test_vertices(
     assert np.allclose(_vertices(centers, width), expected)
 
 
+@pytest.mark.parametrize(
+    argnames="offset,offset_other,height_other,velocity_search",
+    argvalues=[
+        # the line where the files put it, and a weaker one nearby
+        (0, 17, 0.2, 100 * u.km / u.s),
+        # a brighter line beyond the search is not taken for the line,
+        # as N V 1242.8 angstroms is not for Fe XII 1242.0 angstroms
+        (0, 18, 2, 100 * u.km / u.s),
+        (0, -18, 2, 100 * u.km / u.s),
+        # the line 17 columns from where the files put it,
+        # and a weaker line there, as in some files of 2005 and 2007
+        (-17, 0, 0.2, 200 * u.km / u.s),
+        (17, 0, 0.2, 200 * u.km / u.s),
+        (0, 30, 2, 200 * u.km / u.s),
+        (0, -30, 2, 200 * u.km / u.s),
+    ],
+)
+def test_centroid(
+    offset: int,
+    offset_other: int,
+    height_other: float,
+    velocity_search: u.Quantity,
+):
+    """The line is found where it is, not where the files put it."""
+    dispersion = 0.0215 * u.AA
+    num = 101
+    axis = "wavelength"
+    index = na.arange(0, num + 1, axis=axis)
+    wavelengths = _wavelength + (index - num / 2) * dispersion
+    column = (wavelengths.cell_centers(axis) - _wavelength) / dispersion
+    column = column.to(u.dimensionless_unscaled).value
+    line = np.exp(-np.square((column - offset) / 2.4) / 2)
+    other = height_other * np.exp(-np.square((column - offset_other) / 1.7) / 2)
+    exposures = na.ScalarArray(np.ones(3), axes=("detector_x",))
+    radiance = (line + other + 0.05) * exposures * _unit_radiance
+
+    result = _centroid(
+        radiance=radiance,
+        wavelengths=wavelengths,
+        wavelength=_wavelength,
+        axis_wavelength=axis,
+        velocity_search=velocity_search,
+    )
+
+    expected = _wavelength + offset * dispersion
+    assert np.isclose(result, expected, rtol=0, atol=1e-3 * dispersion)
+
+
 class TestSpectrographObservation:
     def test_from_level1(self, path_test: pathlib.Path):
         result = soho.sumer.SpectrographObservation.from_level1(
@@ -311,6 +361,22 @@ class TestSpectrographObservation:
         )
         expected = velocity.to(u.AA, equivalencies=u.doppler_optical(_wavelength))
         assert np.isclose(shifted.shift_wavelength, expected - _wavelength)
+
+    def test_velocity_search(self, path_test: pathlib.Path):
+        kwargs = dict(path=path_test, wavelength=_wavelength, order=2)
+        zeroed = soho.sumer.SpectrographObservation.from_level1(**kwargs)
+        # The line of this file is 7 columns from where the file puts it,
+        # and no brighter line is within 20.
+        wide = soho.sumer.SpectrographObservation.from_level1(
+            velocity_search=200 * u.km / u.s,
+            **kwargs,
+        )
+        assert wide.shift_wavelength == zeroed.shift_wavelength
+        with pytest.raises(ValueError, match="no data within"):
+            soho.sumer.SpectrographObservation.from_level1(
+                velocity_search=0 * u.km / u.s,
+                **kwargs,
+            )
 
     def test_show(self, path_test: pathlib.Path):
         result = soho.sumer.SpectrographObservation.from_level1(
