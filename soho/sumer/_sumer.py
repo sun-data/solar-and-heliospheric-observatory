@@ -2,7 +2,7 @@ from typing import Literal
 import pathlib
 import astropy.units as u
 import astropy.time
-from ._spectrograph import SpectrographObservation
+from ._spectrograph import SpectrographObservation, _velocity_search
 
 __all__ = [
     "open",
@@ -17,6 +17,7 @@ def open(
     timedelta: None | u.Quantity = None,
     slit: None | str = None,
     velocity_zero: None | Literal["mean"] | u.Quantity = "mean",
+    velocity_search: u.Quantity = _velocity_search,
     axis_wavelength: str = "wavelength",
     axis_detector_x: str = "detector_x",
     axis_detector_y: str = "detector_y",
@@ -51,6 +52,10 @@ def open(
     velocity_zero
         Where to put the zero of the Doppler velocity,
         as in :meth:`~soho.sumer.SpectrographObservation.from_level1`.
+    velocity_search
+        How far from where the files put `wavelength` the line is looked for,
+        if `velocity_zero` is ``"mean"``,
+        as in :meth:`~soho.sumer.SpectrographObservation.from_level1`.
     axis_wavelength
         The logical axis corresponding to changes in wavelength.
     axis_detector_x
@@ -74,6 +79,7 @@ def open(
         timedelta=timedelta,
         slit=slit,
         velocity_zero=velocity_zero,
+        velocity_search=velocity_search,
         axis_wavelength=axis_wavelength,
         axis_detector_x=axis_detector_x,
         axis_detector_y=axis_detector_y,

@@ -680,11 +680,15 @@ class TestSpectrographObservation:
 
 
 def test_open():
-    result = soho.sumer.open(
+    kwargs = dict(
         time_start="2005-04-15T15:50:00",
         time_stop="2005-04-15T16:00:00",
         wavelength=_wavelength,
         order=2,
     )
+    result = soho.sumer.open(**kwargs)
     assert isinstance(result, soho.sumer.SpectrographObservation)
     assert result.outputs.shape["detector_x"] > 0
+    # the search is passed on
+    with pytest.raises(ValueError, match="no data within"):
+        soho.sumer.open(velocity_search=0 * u.km / u.s, **kwargs)
