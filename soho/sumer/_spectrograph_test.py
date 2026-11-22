@@ -314,8 +314,9 @@ class TestSpectrographObservation:
         angle: float,
     ):
         kwargs = dict(wavelength=_wavelength, order=2)
+        # The roll of the test file is zero.
         files = soho.sumer.SpectrographObservation.from_level1(
-            path=_rolled(path_test, tmp_path, 0),
+            path=path_test,
             **kwargs,
         )
         rolled = soho.sumer.SpectrographObservation.from_level1(
@@ -329,13 +330,98 @@ class TestSpectrographObservation:
         )
         # the slit is turned by the roll
         radians = np.deg2rad(angle)
+        assert np.all(step.x == 0 * u.arcsec)
         assert np.allclose(step_rolled.x, -np.sin(radians) * step.y)
         assert np.allclose(step_rolled.y, np.cos(radians) * step.y)
-        # about the pointing, which is the middle of the slit
+        # about the pointing of the files, at the reference row,
+        # which is the middle of the slit of the test file
         middle = files.inputs.position.mean(axis_y)
         middle_rolled = rolled.inputs.position.mean(axis_y)
         assert np.allclose(middle_rolled.x, middle.x)
         assert np.allclose(middle_rolled.y, middle.y)
+
+    @pytest.mark.parametrize("angle", [-2.04, 118.86])
+    def test_from_level1_roll_single(
+        self,
+        path_test: pathlib.Path,
+        tmp_path: pathlib.Path,
+        angle: float,
+    ):
+        """The width of a single exposure is turned by the roll."""
+        kwargs = dict(wavelength=_wavelength, order=2)
+        files = soho.sumer.SpectrographObservation.from_level1(
+            path=path_test,
+            **kwargs,
+        )
+        axis_x = files.axis_detector_x
+        start = astropy.time.Time(files.inputs.time[{axis_x: 0}].ndarray)
+        kwargs = kwargs | dict(time_start=start, time_stop=start + 1 * u.s)
+        single = soho.sumer.SpectrographObservation.from_level1(
+            path=path_test,
+            **kwargs,
+        )
+        rolled = soho.sumer.SpectrographObservation.from_level1(
+            path=_rolled(path_test, tmp_path, angle),
+            **kwargs,
+        )
+        assert single.outputs.shape[axis_x] == 1
+        position = single.inputs.position
+        width = position[{axis_x: 1}] - position[{axis_x: 0}]
+        position_rolled = rolled.inputs.position
+        width_rolled = position_rolled[{axis_x: 1}] - position_rolled[{axis_x: 0}]
+        radians = np.deg2rad(angle)
+        assert np.all(width.x > 0 * u.arcsec)
+        assert np.all(width.y == 0 * u.arcsec)
+        assert np.allclose(width_rolled.x, np.cos(radians) * width.x)
+        assert np.allclose(width_rolled.y, np.sin(radians) * width.x)
+
+    @pytest.mark.parametrize(
+        argnames="angles,expected",
+        argvalues=[
+            ((-2.1, -1.9), -2),
+            # on either side of 180 degrees
+            ((179.5, -179.5), 180),
+        ],
+    )
+    def test_from_level1_roll_mean(
+        self,
+        path_test: pathlib.Path,
+        tmp_path: pathlib.Path,
+        angles: tuple[float, float],
+        expected: float,
+    ):
+        """Exposures of slightly different rolls are turned by their mean."""
+        kwargs = dict(wavelength=_wavelength, order=2)
+        files = soho.sumer.SpectrographObservation.from_level1(
+            path=path_test,
+            **kwargs,
+        )
+        rolled = soho.sumer.SpectrographObservation.from_level1(
+            path=[_rolled(path_test, tmp_path, angle) for angle in angles],
+            **kwargs,
+        )
+        axis_x = rolled.axis_detector_x
+        axis_y = rolled.axis_detector_y
+        index = {axis_x: 0, axis_y: 1}
+        index_other = {axis_x: 0, axis_y: 0}
+        step = files.inputs.position[index] - files.inputs.position[index_other]
+        position = rolled.inputs.position
+        step_rolled = position[index] - position[index_other]
+        radians = np.deg2rad(expected)
+        assert np.allclose(step_rolled.x, -np.sin(radians) * step.y)
+        assert np.allclose(step_rolled.y, np.cos(radians) * step.y)
+
+    def test_from_level1_roll_differ(
+        self,
+        path_test: pathlib.Path,
+        tmp_path: pathlib.Path,
+    ):
+        with pytest.raises(ValueError, match="differ in their roll"):
+            soho.sumer.SpectrographObservation.from_level1(
+                path=[path_test, _rolled(path_test, tmp_path, 118.86)],
+                wavelength=_wavelength,
+                order=2,
+            )
 
     def test_from_level1_time_range(self, path_test: pathlib.Path):
         result = soho.sumer.SpectrographObservation.from_level1(
@@ -474,20 +560,39 @@ class TestSpectrographObservation:
             wavelength=_wavelength,
             order=2,
         )
-        # a raster turned a quarter of a turn steps along y alone
+        # a raster turned a quarter of a turn steps along y alone,
+        # with the slit along x
         axis_x = result.axis_detector_x
         position = result.inputs.position
-        num = position.x.shape[axis_x]
-        step = na.ScalarArray(np.arange(num) << u.arcsec, axes=axis_x)
-        position = na.Cartesian2dVectorArray(
-            x=0 * position.x + position.x[{axis_x: 0}],
-            y=position.y + step,
-        )
+        position = na.Cartesian2dVectorArray(x=-position.y, y=position.x)
+        assert np.all(np.diff(position.x, axis=axis_x) == 0 * u.arcsec)
         along_y = dataclasses.replace(
             result,
             inputs=dataclasses.replace(result.inputs, position=position),
         )
         assert isinstance(along_y.show(), matplotlib.axes.Axes)
+        plt.close("all")
+
+    def test_show_along_slit(self, path_test: pathlib.Path):
+        """A sequence which moves the slit along itself is not a raster."""
+        result = soho.sumer.SpectrographObservation.from_level1(
+            path=path_test,
+            wavelength=_wavelength,
+            order=2,
+        )
+        axis_x = result.axis_detector_x
+        position = result.inputs.position
+        num = position.x.shape[axis_x]
+        position = na.Cartesian2dVectorArray(
+            x=0 * position.x + position.x[{axis_x: 0}],
+            y=position.y + na.arange(0, num, axis=axis_x) * u.arcsec,
+        )
+        along_slit = dataclasses.replace(
+            result,
+            inputs=dataclasses.replace(result.inputs, position=position),
+        )
+        with pytest.raises(ValueError, match="not a raster"):
+            along_slit.show()
         plt.close("all")
 
     def test_from_level1_timedelta_tolerance(self, path_test: pathlib.Path):

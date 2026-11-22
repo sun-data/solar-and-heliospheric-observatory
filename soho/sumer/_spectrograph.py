@@ -65,6 +65,16 @@ How far apart, relative to it, the size of a column of one window may be in
 two exposures for them to be loaded together.
 """
 
+_tolerance_roll = 1
+"""
+How far, in degrees, the roll of the instrument in one exposure may be from
+the mean roll of the exposures for them to be loaded together.
+
+The roll drifts by up to about a tenth of a degree in a day,
+and by a few tenths of a degree over the weeks of a campaign,
+but it was 119 degrees on 1999 February 27.
+"""
+
 _tolerance_timedelta = 1e-3
 """
 How far apart, relative to it, an exposure time may be from the one asked for
@@ -501,7 +511,9 @@ def _vertices(centers: np.ndarray, width: float) -> np.ndarray:
     centers
         The positions, in order of time.
     width
-        The width of a single exposure,
+        The width of a single exposure along the coordinate of `centers`,
+        which is negative if the coordinate decreases from one side of the
+        slit to the other,
         used for the edges if there is only one position.
     """
     if len(centers) == 1:
@@ -692,7 +704,7 @@ class SpectrographObservation(
         ValueError
             If no exposure is kept,
             or if the kept exposures do not share one window, one detector,
-            and one slit.
+            one slit, and one roll of the instrument, to within a degree.
         NotImplementedError
             If the kept exposures are binned.
         """
@@ -769,6 +781,20 @@ class SpectrographObservation(
                     f"The exposures differ in their {key}, {sorted(set(map(str, values)))}; "
                     "select one sequence with the time range, `timedelta`, or `slit`."
                 )
+
+        # The exposures are turned by their mean roll,
+        # taken around the circle so that rolls on either side of 180 degrees
+        # are near each other.
+        rolls = np.deg2rad([_number(h, "ANGLE") for h in headers])
+        angle = np.arctan2(np.mean(np.sin(rolls)), np.mean(np.cos(rolls)))
+        spread = np.rad2deg(np.abs((rolls - angle + np.pi) % (2 * np.pi) - np.pi).max())
+        if spread > _tolerance_roll:
+            raise ValueError(
+                f"The exposures differ in their roll, ANGLE, by up to {spread:.2f} "
+                "degrees from their mean; "
+                "select one sequence with the time range, `timedelta`, or `slit`."
+            )
+
         header = headers[0]
 
         # The columns around the line which hold data in any exposure,
@@ -820,8 +846,6 @@ class SpectrographObservation(
         # and the width of the slit along its x axis,
         # which are turned from those of the files by the roll of the
         # instrument.
-        # It drifts by about a hundredth of a degree in a day.
-        angle = np.deg2rad(np.median([_number(h, "ANGLE") for h in headers]))
         cos = np.cos(angle)
         sin = np.sin(angle)
 
@@ -1146,18 +1170,25 @@ class SpectrographObservation(
         ------
         ValueError
             If the slit stood still between two exposures,
-            as in a sequence which is a series in time rather than a raster.
+            as in a sequence which is a series in time rather than a raster,
+            or moved along itself.
         """
         axis_wavelength = self.axis_wavelength
         axis_x = self.axis_detector_x
         axis_y = self.axis_detector_y
 
-        # A rolled raster can step along y alone.
-        step_x = _diff(self.inputs.position.x, axis=axis_x)
-        step_y = _diff(self.inputs.position.y, axis=axis_x)
-        if np.any((step_x == 0 * u.arcsec) & (step_y == 0 * u.arcsec)):
+        # Each step of a raster crosses the slit,
+        # whichever way the roll of the instrument turned them both.
+        position = self.inputs.position
+        slit = position[{axis_x: 0, axis_y: 1}] - position[{axis_x: 0, axis_y: 0}]
+        slit = typing.cast(na.Cartesian2dVectorArray, slit)
+        step_x = _diff(position.x, axis=axis_x)
+        step_y = _diff(position.y, axis=axis_x)
+        across = step_x * slit.y - step_y * slit.x
+        if np.any(across == 0 * u.arcsec**2):
             raise ValueError(
-                "The slit stood still between exposures, so they are not a raster."
+                "The slit stood still between exposures, or moved along itself, "
+                "so they are not a raster."
             )
 
         outputs = self.outputs.copy()
