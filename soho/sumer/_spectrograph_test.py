@@ -1,4 +1,7 @@
+import io
+import tarfile
 import pathlib
+import warnings
 import dataclasses
 import pytest
 import numpy as np
@@ -8,6 +11,7 @@ import astropy.units as u
 import astropy.time
 import astropy.io.fits
 import soho
+import named_arrays as na
 from soho.sumer._spectrograph import _window, _extent, _vertices
 
 _wavelength = 629.73 * u.AA
@@ -20,6 +24,45 @@ def _header(**cards: float | int | str) -> astropy.io.fits.Header:
     for key, value in cards.items():
         header[key] = value
     return header
+
+
+def _rolled(
+    path: pathlib.Path,
+    directory: pathlib.Path,
+    angle: float,
+) -> pathlib.Path:
+    """
+    A copy of a level-1 file whose exposures give another roll of the
+    instrument, ``ANGLE``, with the same pointing.
+
+    Parameters
+    ----------
+    path
+        The level-1 file.
+    directory
+        The directory to write the copy in.
+    angle
+        The roll of the copy, in degrees.
+    """
+    result = directory / f"rolled_{angle}.tgz"
+    with tarfile.open(path, "r:gz") as source, tarfile.open(result, "w:gz") as copy:
+        for member in source:
+            content = source.extractfile(member)
+            if content is None:
+                continue
+            data = content.read()
+            if member.name.endswith(".fits"):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    hdul = astropy.io.fits.open(io.BytesIO(data))
+                    hdul[0].header["ANGLE"] = angle
+                    buffer = io.BytesIO()
+                    hdul.writeto(buffer, output_verify="ignore")
+                data = buffer.getvalue()
+            info = tarfile.TarInfo(member.name)
+            info.size = len(data)
+            copy.addfile(info, io.BytesIO(data))
+    return result
 
 
 @pytest.mark.parametrize(
@@ -263,6 +306,37 @@ class TestSpectrographObservation:
         mean = np.nanmean(radiance.ndarray)
         assert 0.01 * u.W / (u.sr * u.m**2) < mean < 10 * u.W / (u.sr * u.m**2)
 
+    @pytest.mark.parametrize("angle", [-2.04, 118.86, 180])
+    def test_from_level1_roll(
+        self,
+        path_test: pathlib.Path,
+        tmp_path: pathlib.Path,
+        angle: float,
+    ):
+        kwargs = dict(wavelength=_wavelength, order=2)
+        files = soho.sumer.SpectrographObservation.from_level1(
+            path=_rolled(path_test, tmp_path, 0),
+            **kwargs,
+        )
+        rolled = soho.sumer.SpectrographObservation.from_level1(
+            path=_rolled(path_test, tmp_path, angle),
+            **kwargs,
+        )
+        axis_y = rolled.axis_detector_y
+        step = files.inputs.position[{axis_y: 1}] - files.inputs.position[{axis_y: 0}]
+        step_rolled = (
+            rolled.inputs.position[{axis_y: 1}] - rolled.inputs.position[{axis_y: 0}]
+        )
+        # the slit is turned by the roll
+        radians = np.deg2rad(angle)
+        assert np.allclose(step_rolled.x, -np.sin(radians) * step.y)
+        assert np.allclose(step_rolled.y, np.cos(radians) * step.y)
+        # about the pointing, which is the middle of the slit
+        middle = files.inputs.position.mean(axis_y)
+        middle_rolled = rolled.inputs.position.mean(axis_y)
+        assert np.allclose(middle_rolled.x, middle.x)
+        assert np.allclose(middle_rolled.y, middle.y)
+
     def test_from_level1_time_range(self, path_test: pathlib.Path):
         result = soho.sumer.SpectrographObservation.from_level1(
             path=[path_test],
@@ -385,16 +459,35 @@ class TestSpectrographObservation:
             order=2,
         )
         position = result.inputs.position
-        x = 0 * position.x + position.x[{result.axis_detector_x: 0}]
+        position = 0 * position + position[{result.axis_detector_x: 0}]
         still = dataclasses.replace(
             result,
-            inputs=dataclasses.replace(
-                result.inputs,
-                position=dataclasses.replace(position, x=x),
-            ),
+            inputs=dataclasses.replace(result.inputs, position=position),
         )
         with pytest.raises(ValueError, match="not a raster"):
             still.show()
+        plt.close("all")
+
+    def test_show_along_y(self, path_test: pathlib.Path):
+        result = soho.sumer.SpectrographObservation.from_level1(
+            path=path_test,
+            wavelength=_wavelength,
+            order=2,
+        )
+        # a raster turned a quarter of a turn steps along y alone
+        axis_x = result.axis_detector_x
+        position = result.inputs.position
+        num = position.x.shape[axis_x]
+        step = na.ScalarArray(np.arange(num) << u.arcsec, axes=axis_x)
+        position = na.Cartesian2dVectorArray(
+            x=0 * position.x + position.x[{axis_x: 0}],
+            y=position.y + step,
+        )
+        along_y = dataclasses.replace(
+            result,
+            inputs=dataclasses.replace(result.inputs, position=position),
+        )
+        assert isinstance(along_y.show(), matplotlib.axes.Axes)
         plt.close("all")
 
     def test_from_level1_timedelta_tolerance(self, path_test: pathlib.Path):

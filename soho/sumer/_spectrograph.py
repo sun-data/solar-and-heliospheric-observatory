@@ -556,8 +556,10 @@ class SpectrographObservation(
     exposure, ``DATE_OBS``, and the last is the end of the last exposure;
     the positions are those of the coordinate system of each file,
     with each edge of a raster step halfway between the two exposures beside
-    it, and they do not include the small roll of the instrument,
-    which the files give as ``ANGLE``;
+    it, and with the slit turned from solar north by the roll of the
+    instrument, which the files give as ``ANGLE``,
+    and which is two degrees or less in most files but 119 degrees in some
+    of 1999;
     and the wavelengths are those of the line which was observed,
     in :attr:`order`.
 
@@ -814,9 +816,18 @@ class SpectrographObservation(
         index_row = np.arange(num_row + 1) + 0.5
         offset_y = (index_row - _number(header, "CRPIX2")) * _number(header, "CDELT2")
 
+        # The slit lies along the y axis of the instrument,
+        # and the width of the slit along its x axis,
+        # which are turned from those of the files by the roll of the
+        # instrument.
+        # It drifts by about a hundredth of a degree in a day.
+        angle = np.deg2rad(np.median([_number(h, "ANGLE") for h in headers]))
+        cos = np.cos(angle)
+        sin = np.sin(angle)
+
         width = _number(header, "IXWIDTH")
-        x = _vertices(np.array([_number(h, "CRVAL3") for h in headers]), width)
-        y = _vertices(np.array([_number(h, "CRVAL2") for h in headers]), 0)
+        x = _vertices(np.array([_number(h, "CRVAL3") for h in headers]), width * cos)
+        y = _vertices(np.array([_number(h, "CRVAL2") for h in headers]), width * sin)
 
         time_vertices = astropy.time.Time(
             [e.time.isot for e in exposures] + [_text(headers[~0], "DATE_END")],
@@ -830,9 +841,10 @@ class SpectrographObservation(
             wavelength=wavelengths,
             wavelength_rest=wavelength,
             position=na.Cartesian2dVectorArray(
-                x=na.ScalarArray(x << u.arcsec, axes=axis_detector_x),
+                x=na.ScalarArray(x << u.arcsec, axes=axis_detector_x)
+                - na.ScalarArray(offset_y * sin << u.arcsec, axes=axis_detector_y),
                 y=na.ScalarArray(y << u.arcsec, axes=axis_detector_x)
-                + na.ScalarArray(offset_y << u.arcsec, axes=axis_detector_y),
+                + na.ScalarArray(offset_y * cos << u.arcsec, axes=axis_detector_y),
             ),
         )
 
@@ -1140,8 +1152,10 @@ class SpectrographObservation(
         axis_x = self.axis_detector_x
         axis_y = self.axis_detector_y
 
-        step = _diff(self.inputs.position.x, axis=axis_x)
-        if np.any(step == 0 * u.arcsec):
+        # A rolled raster can step along y alone.
+        step_x = _diff(self.inputs.position.x, axis=axis_x)
+        step_y = _diff(self.inputs.position.y, axis=axis_x)
+        if np.any((step_x == 0 * u.arcsec) & (step_y == 0 * u.arcsec)):
             raise ValueError(
                 "The slit stood still between exposures, so they are not a raster."
             )
