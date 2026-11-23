@@ -100,6 +100,23 @@ How far on either side of the brightest part of the mean profile the
 centroid of the line is found, when the line is zeroed on its mean position.
 """
 
+_response_min = 0.1
+"""
+The least fraction of a tilt which the centroids within the band of
+:meth:`SpectrographObservation.remove_tilt` must measure for the search of the
+tilt to go on.
+
+The centroids of a line measure about a third of a tilt or more;
+those of a band with no line in it hardly respond.
+"""
+
+_response_max = 2
+"""
+The largest fraction of a tilt which the centroids within the band of
+:meth:`SpectrographObservation.remove_tilt` may measure for the search of the
+tilt to go on.
+"""
+
 _unit_radiance = u.W / (u.sr * u.m**2 * u.AA)
 """The unit of the level-1 radiances, which the files call ``W/sr/m^2/Angstroem``."""
 
@@ -530,6 +547,139 @@ def _vertices(centers: np.ndarray, width: float) -> np.ndarray:
     first = centers[0] - (middle[0] - centers[0])
     last = centers[~0] + (centers[~0] - middle[~0])
     return np.concatenate([[first], middle, [last]])
+
+
+def _shift_rows(radiance: np.ndarray, shift: np.ndarray) -> np.ndarray:
+    """
+    The spectra with each row of the slit shifted by some columns,
+    the radiance of each column going into the two columns it overlaps once
+    shifted, which keeps the total of each row away from the ends of the
+    spectrum.
+
+    A column which takes radiance from beyond the ends of the spectrum,
+    or from a column with no data, has no data once shifted.
+
+    Parameters
+    ----------
+    radiance
+        The radiances, along the exposures, the slit, and wavelength.
+    shift
+        For each row of the slit, how many columns toward the start of the
+        spectrum it moves.
+    """
+    num = radiance.shape[~0]
+    source = np.arange(num)[np.newaxis, :] + shift[:, np.newaxis]
+    low = np.floor(source).astype(int)
+    fraction = source - low
+    valid = (low >= 0) & (low < num) & ((fraction == 0) | (low + 1 < num))
+    index_low = np.clip(low, 0, num - 1)[np.newaxis]
+    index_high = np.clip(low + 1, 0, num - 1)[np.newaxis]
+    value_low = np.take_along_axis(radiance, index_low, axis=~0)
+    value_high = np.take_along_axis(radiance, index_high, axis=~0)
+    # a whole number of columns takes nothing from the next column,
+    # which may have no data
+    shared = (1 - fraction) * value_low + fraction * value_high
+    result = np.where(fraction > 0, shared, value_low)
+    return np.where(valid[np.newaxis], result, np.nan)
+
+
+def _fill_dead_columns(radiance: np.ndarray) -> np.ndarray:
+    """
+    The spectra with each column which has no data in any pixel,
+    a dead column of the detector,
+    filled by linear interpolation between the nearest columns with data on
+    either side, where there are such columns on both sides.
+
+    Parameters
+    ----------
+    radiance
+        The radiances, along the exposures, the slit, and wavelength.
+    """
+    alive = np.flatnonzero(np.any(np.isfinite(radiance), axis=(0, 1)))
+    result = radiance.copy()
+    if not alive.size:
+        return result
+    dead = np.setdiff1d(np.arange(alive[0], alive[~0] + 1), alive)
+    for column in dead:
+        left = alive[alive < column][~0]
+        right = alive[alive > column][0]
+        weight = (column - left) / (right - left)
+        result[..., column] = (1 - weight) * radiance[..., left]
+        result[..., column] += weight * radiance[..., right]
+    return result
+
+
+def _centroids_rows(
+    radiance: np.ndarray,
+    velocity: np.ndarray,
+    velocity_band: float,
+    fraction_bright: float,
+    num_min: int,
+) -> np.ndarray:
+    """
+    For each row of the slit, the median over its bright pixels of the
+    centroid of the line within `velocity_band` of zero velocity,
+    or not a number (NaN) for a row with fewer than `num_min` bright pixels.
+
+    A pixel is used only if every column of the band has data,
+    and it is bright if its radiance over the band is more than
+    `fraction_bright` of the 95th percentile of those radiances.
+
+    Parameters
+    ----------
+    radiance
+        The radiances, along the exposures, the slit, and wavelength.
+    velocity
+        The Doppler velocity of the middle of each column.
+    velocity_band
+        The half width of the band, in the unit of `velocity`.
+    fraction_bright
+        The least radiance of a bright pixel over the band,
+        relative to the 95th percentile of those radiances.
+    num_min
+        The least number of bright pixels in a row for its median.
+    """
+    band = np.abs(velocity) <= velocity_band
+    inside = radiance[..., band]
+    observed = np.all(np.isfinite(inside), axis=~0)
+    result = np.full(radiance.shape[1], np.nan)
+    if not np.any(observed):
+        return result
+    filled = np.where(observed[..., np.newaxis], inside, 0)
+    total = filled.sum(axis=~0)
+    threshold = fraction_bright * np.percentile(total[observed], 95)
+    bright = observed & (total > threshold) & (total > 0)
+    centroid = np.divide(
+        (filled * velocity[band]).sum(axis=~0),
+        total,
+        out=np.zeros_like(total),
+        where=bright,
+    )
+    count = bright.sum(axis=0)
+    for j in np.flatnonzero(count >= num_min):
+        result[j] = np.median(centroid[bright[:, j], j])
+    return result
+
+
+def _slope(x: np.ndarray, y: np.ndarray) -> float:
+    """
+    The slope of a straight line fitted to some points, fitted again without
+    the points more than four robust standard deviations from it.
+
+    Parameters
+    ----------
+    x
+        The abscissas of the points.
+    y
+        The ordinates of the points.
+    """
+    coefficients = np.polynomial.polynomial.polyfit(x, y, deg=1)
+    residual = y - np.polynomial.polynomial.polyval(x, coefficients)
+    scatter = 1.4826 * np.median(np.abs(residual))
+    kept = np.abs(residual) <= 4 * scatter
+    if scatter > 0 and np.count_nonzero(kept) >= 2:
+        coefficients = np.polynomial.polynomial.polyfit(x[kept], y[kept], deg=1)
+    return float(coefficients[1])
 
 
 @dataclasses.dataclass(eq=False, repr=False)
@@ -1164,6 +1314,184 @@ class SpectrographObservation(
         smooth = scipy.ndimage.median_filter(filled, size=size, mode="nearest")
         gain = np.where(valid, np.clip(filled / smooth, gain_min, gain_max), 1)
         return self._with_radiance(radiance / gain[np.newaxis, :, np.newaxis])
+
+    def remove_tilt(
+        self,
+        velocity_band: u.Quantity = 40 * u.km / u.s,
+        fraction_bright: float = 0.2,
+        num_min: int = 10,
+        tolerance: u.Quantity = 0.01 * u.km / u.s,
+        num_iteration: int = 10,
+    ) -> "SpectrographObservation":
+        """
+        Shift the spectrum of each row of the slit to remove a tilt of the
+        spectrum along the slit:
+        a shift of the line which changes in proportion to the position
+        along the slit.
+
+        The tilt is measured from the line itself,
+        which has to lie within `velocity_band` of zero velocity,
+        as :meth:`from_level1` puts it by default.
+        In each row, the centroid of the line within `velocity_band` of zero
+        is found in each bright pixel,
+        and a straight line is fitted along the slit to the medians of the
+        rows.
+        Each row is then shifted by the straight line,
+        which is zero at the middle of the rows weighted by their radiance
+        in the band, so that the mean profile of the line,
+        whose centroid :meth:`from_level1` puts at zero, does not move.
+        A centroid within a band is pulled toward the middle of the band,
+        by the wings of the line beyond it and by the continuum under it,
+        which makes a tilt measure as little as a third of itself,
+        so the tilt removed is the one which leaves no tilt in the centroids
+        of the spectra once they are shifted by it,
+        found by the secant method,
+        and the radiances are shifted only once, by that tilt.
+        The search steps only while the centroids respond to the tilt as
+        those of a line do, it goes no further than a change of twice
+        `velocity_band` from one end of the rows it measures to the other,
+        and the tilt removed is the one which measured least of those tried.
+        Columns with no data in any pixel, the dead columns of the detector,
+        are filled by interpolation for the measurement only.
+
+        If the mean profile has no peak within the band,
+        or no two rows have enough bright pixels,
+        or the tilt measures less than `tolerance` to begin with,
+        the observation is returned as it is.
+
+        This assumes that the Sun itself has no gradient of the shift of the
+        line along the slit, once it is averaged over the exposures.
+        That holds in the quiet Sun on the disk,
+        where O V 629.7 angstroms tilts by as much as 20 kilometers per second
+        from one end of a 120-arcsecond slit to the other in some rasters,
+        and Si II 1260.4 angstroms, a cooler line in the same window,
+        tilts alike, which shows that the tilt is instrumental.
+        It does not hold in active regions, whose flows it would remove,
+        nor near the limb, where the shift of a transition-region line changes
+        with the distance from the center of the disk.
+        A curvature of the spectrum along the slit is not removed,
+        since the curvatures of O V seen in the quiet Sun are not seen in
+        Si II, and so are not known to be instrumental.
+
+        The radiance of each column is shared between the two columns it
+        overlaps once shifted, which keeps the total radiance of each row
+        but adds as much as a quarter of a column squared to the variance of a
+        line, and a column next to one with no data has no data once shifted.
+        The tilt removed is not recorded,
+        and the spectra of the rows no longer lie where the wavelengths
+        of the files, plus :attr:`shift_wavelength`, put them.
+
+        Parameters
+        ----------
+        velocity_band
+            The half width of the band around zero velocity
+            over which the centroid of the line is found.
+        fraction_bright
+            The least radiance of a bright pixel over the band,
+            relative to the 95th percentile of those radiances.
+        num_min
+            The least number of bright pixels in a row for its median.
+        tolerance
+            How small the change of the centroids from one end of the rows
+            measured to the other has to be once the tilt is removed.
+        num_iteration
+            The most times the tilt is measured again, after it is first
+            measured as the spectra are.
+        """
+        radiance = self._radiance_aligned()
+        velocities = typing.cast(na.AbstractScalarArray, self.inputs.velocity)
+        middles = velocities.cell_centers(self.axis_wavelength)
+        middles = typing.cast(na.ScalarArray, middles)
+        middles = middles.ndarray_aligned((self.axis_wavelength,))
+        velocity = np.asarray(typing.cast(u.Quantity, middles).to_value(u.km / u.s))
+        step = float(np.mean(np.diff(velocity)))
+        band = float(typing.cast(float, velocity_band.to_value(u.km / u.s)))
+        change_min = float(typing.cast(float, tolerance.to_value(u.km / u.s)))
+        rows = np.arange(radiance.shape[1], dtype=float)
+
+        # The tilt is measured on the band alone, with as many columns on
+        # each side as the largest shift the search can make.
+        inside = np.flatnonzero(np.abs(velocity) <= band)
+        if not inside.size:
+            return self
+        margin = int(np.ceil(2 * band / abs(step))) + 2
+        start = max(int(inside[0]) - margin, 0)
+        stop = min(int(inside[~0]) + margin + 1, velocity.size)
+        cube = _fill_dead_columns(radiance[..., start:stop])
+        velocity_cube = velocity[start:stop]
+        in_band = np.abs(velocity_cube) <= band
+
+        # the line has to make a peak of the mean profile inside the band
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            profile = np.nanmean(cube, axis=(0, 1))[in_band]
+        if not np.any(np.isfinite(profile)):
+            return self
+        peak = int(np.nanargmax(profile))
+        if peak == 0 or peak == profile.size - 1:
+            return self
+
+        def centroids(shift: np.ndarray) -> np.ndarray:
+            """The centroid of each row, with each row shifted by some columns."""
+            return _centroids_rows(
+                radiance=_shift_rows(cube, shift),
+                velocity=velocity_cube,
+                velocity_band=band,
+                fraction_bright=fraction_bright,
+                num_min=num_min,
+            )
+
+        centroid = centroids(np.zeros_like(rows))
+        finite = np.isfinite(centroid)
+        if np.count_nonzero(finite) < 2:
+            return self
+
+        # the shift is zero at the middle of the rows weighted by their
+        # radiance in the band, which keeps the mean profile where it is
+        weight = np.nansum(cube[..., in_band], axis=(0, 2))
+        middle = float(np.sum(weight * rows) / np.sum(weight))
+        span = max(float(np.ptp(rows[finite])), 1)
+        tolerance_row = change_min / span
+        tilt_max = 2 * band / span
+
+        def measured(tilt: float) -> float:
+            """The tilt of the centroids, with the spectra shifted by a tilt."""
+            centroid = centroids(tilt * (rows - middle) / step)
+            finite = np.isfinite(centroid)
+            if np.count_nonzero(finite) < 2:
+                return np.nan
+            return _slope(rows[finite], centroid[finite])
+
+        tilt_old = 0.0
+        measured_old = _slope(rows[finite], centroid[finite])
+        if abs(measured_old) < tolerance_row:
+            return self
+        tried = {tilt_old: measured_old}
+        tilt = float(np.clip(measured_old, -tilt_max, tilt_max))
+        for _ in range(num_iteration):
+            measured_new = measured(tilt)
+            if not np.isfinite(measured_new):
+                break
+            tried[tilt] = measured_new
+            if abs(measured_new) < tolerance_row:
+                break
+            # the centroids of a line measure a fraction of the tilt removed
+            response = -(measured_new - measured_old) / (tilt - tilt_old)
+            if not _response_min <= response <= _response_max:
+                break
+            tilt_next = float(
+                np.clip(tilt + measured_new / response, -tilt_max, tilt_max)
+            )
+            if tilt_next == tilt:
+                break
+            tilt_old, measured_old = tilt, measured_new
+            tilt = tilt_next
+
+        best = min(tried, key=lambda t: abs(tried[t]))
+        if best == 0:
+            return self
+        shift = best * (rows - middle) / step
+        return self._with_radiance(_shift_rows(radiance, shift))
 
     def show(
         self,
