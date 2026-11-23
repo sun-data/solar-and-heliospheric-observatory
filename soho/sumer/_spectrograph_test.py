@@ -14,6 +14,7 @@ import soho
 import named_arrays as na
 from soho.sumer._spectrograph import _window, _extent, _vertices
 from soho.sumer._spectrograph import _centroid, _unit_radiance
+from soho.sumer._spectrograph import _shift_rows, _centroids_rows, _slope
 
 _wavelength = 629.73 * u.AA
 """The wavelength of O V."""
@@ -322,6 +323,80 @@ def test_centroid(
     assert np.isclose(result, expected, rtol=0, atol=1e-3 * dispersion)
 
 
+def _lines(centers: np.ndarray, num_exposure: int = 3, num: int = 41) -> np.ndarray:
+    """
+    Gaussian lines of 2.4 columns, one row of the slit for each center,
+    in columns from the middle of the spectrum, along the exposures, the slit,
+    and wavelength.
+    """
+    column = np.arange(num) - num // 2
+    rows = np.exp(-np.square((column - centers[:, np.newaxis]) / 2.4) / 2)
+    return np.broadcast_to(rows, (num_exposure, *rows.shape)).copy()
+
+
+def _columns(radiance: np.ndarray) -> np.ndarray:
+    """The centroid of each spectrum, in columns from the middle of the spectrum."""
+    column = np.arange(radiance.shape[~0]) - radiance.shape[~0] // 2
+    return np.nansum(radiance * column, axis=~0) / np.nansum(radiance, axis=~0)
+
+
+@pytest.mark.parametrize("shift", [0, 0.3, -1.5, 2, -0.75])
+def test_shift_rows(shift: float):
+    """A row moves toward the start of the spectrum, and keeps its radiance."""
+    radiance = _lines(np.array([0.0, 1.0]))
+    result = _shift_rows(radiance, np.array([shift, 0]))
+    assert np.allclose(_columns(result)[:, 0], -shift)
+    assert np.allclose(np.nansum(result, axis=~0), np.nansum(radiance, axis=~0))
+    assert np.array_equal(result[:, 1], radiance[:, 1])
+
+
+def test_shift_rows_ends():
+    """A column which takes radiance from beyond the spectrum, or from a column
+    with no data, has no data."""
+    radiance = _lines(np.array([0.0]))
+    radiance[:, :, 20] = np.nan
+    result = _shift_rows(radiance, np.array([0.5]))
+    assert np.all(np.isnan(result[:, :, [19, 20, ~0]]))
+    assert np.all(np.isfinite(result[:, :, [18, 21, ~1]]))
+    # a whole number of columns takes nothing from the next one
+    whole = _shift_rows(radiance, np.array([1.0]))
+    assert np.all(np.isnan(whole[:, :, [19, ~0]]))
+    assert np.all(np.isfinite(whole[:, :, [18, 20, ~1]]))
+
+
+def test_centroids_rows():
+    """The median centroid of the bright pixels of each row."""
+    step = 10
+    radiance = _lines(np.array([0, 0.5, -1, 0.2]), num_exposure=12)
+    velocity = step * (np.arange(radiance.shape[~0]) - radiance.shape[~0] // 2)
+    # faint pixels are left out, and a row with too few bright pixels has
+    # no median
+    radiance[:4, 2] = 0.01 * radiance[:4, 2]
+    radiance[:9, 3] = np.nan
+    # a band wide enough that it cuts off none of the line
+    result = _centroids_rows(
+        radiance=radiance,
+        velocity=velocity,
+        velocity_band=100,
+        fraction_bright=0.2,
+        num_min=5,
+    )
+    assert np.allclose(result[:3], step * np.array([0, 0.5, -1]), atol=0.01)
+    assert np.isnan(result[3])
+    # no pixel with data over the whole band
+    none = _centroids_rows(np.full_like(radiance, np.nan), velocity, 100, 0.2, 5)
+    assert np.all(np.isnan(none))
+
+
+def test_slope():
+    """A straight line through points, with one far from it left out."""
+    x = np.arange(20, dtype=float)
+    y = 0.5 * x + 3
+    y[7] = 100
+    assert np.isclose(_slope(x, y), 0.5)
+    assert np.isclose(_slope(x[:2], y[:2]), 0.5)
+
+
 class TestSpectrographObservation:
     def test_from_level1(self, path_test: pathlib.Path):
         result = soho.sumer.SpectrographObservation.from_level1(
@@ -602,6 +677,102 @@ class TestSpectrographObservation:
         assert contrast(removed) < contrast(
             striped.remove_stripes(gain_max=1, gain_min=1)._radiance_aligned()
         )
+
+    def test_remove_tilt(self, path_test: pathlib.Path):
+        """A tilt put into the spectra is taken out, and the zero stays."""
+        result = soho.sumer.SpectrographObservation.from_level1(
+            path=path_test,
+            wavelength=_wavelength,
+            order=2,
+        ).trim_slit()
+        radiance = result._radiance_aligned()
+        rows = np.arange(radiance.shape[1], dtype=float)
+        # a tilt of two columns, about 20 km/s, from one end of the slit to
+        # the other
+        tilt = 2 * (rows - rows.mean()) / (rows.size - 1)
+        tilted = result._with_radiance(_shift_rows(radiance, tilt))
+
+        edges = result.inputs.wavelength.ndarray_aligned((result.axis_wavelength,))
+        middles = (edges[1:] + edges[:-1]) / 2
+        velocity = middles.to_value(
+            u.km / u.s,
+            equivalencies=u.doppler_optical(_wavelength),
+        )
+
+        def centroids(observation: soho.sumer.SpectrographObservation) -> np.ndarray:
+            """The median centroid of each row, in km/s."""
+            return _centroids_rows(
+                radiance=observation._radiance_aligned(),
+                velocity=velocity,
+                velocity_band=40,
+                fraction_bright=0.2,
+                num_min=10,
+            )
+
+        def change(observation: soho.sumer.SpectrographObservation) -> float:
+            """The change of the centroid from one end of the slit to the other, km/s."""
+            centroid = centroids(observation)
+            finite = np.isfinite(centroid)
+            return _slope(rows[finite], centroid[finite]) * (rows.size - 1)
+
+        # the band leaves out the wings of the line, so the tilt measures
+        # much less than it is
+        assert abs(change(tilted) - change(result)) > 3
+        removed = tilted.remove_tilt()
+        assert abs(change(removed)) < 0.05
+        assert abs(np.nanmean(centroids(removed)) - np.nanmean(centroids(tilted))) < 0.5
+        assert removed.inputs is tilted.inputs
+        # all of the tilt put in is taken out, not only what the band measures
+        expected = centroids(result.remove_tilt())
+        difference = centroids(removed) - expected
+        assert np.sqrt(np.nanmean(np.square(difference))) < 0.5
+
+    @pytest.mark.parametrize("response", ["vanishing", "flat"])
+    def test_remove_tilt_stops(
+        self,
+        path_test: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        response: str,
+    ):
+        """
+        The search for the tilt stops if the centroids can no longer be
+        measured once the spectra are shifted, or stop changing.
+        """
+        result = soho.sumer.SpectrographObservation.from_level1(
+            path=path_test,
+            wavelength=_wavelength,
+            order=2,
+        ).trim_slit()
+        calls = []
+
+        def centroids_rows(
+            radiance: np.ndarray,
+            velocity: np.ndarray,
+            velocity_band: float,
+            fraction_bright: float,
+            num_min: int,
+        ) -> np.ndarray:
+            """A tilt of 1 km/s per row however the spectra are shifted,
+            which vanishes after the first measurement if asked to."""
+            calls.append(radiance.shape)
+            rows = np.arange(radiance.shape[1], dtype=float)
+            if len(calls) > 1 and response == "vanishing":
+                return np.full_like(rows, np.nan)
+            return rows
+
+        monkeypatch.setattr(soho.sumer._spectrograph, "_centroids_rows", centroids_rows)
+        removed = result.remove_tilt()
+        assert len(calls) == 2
+        assert removed.outputs.shape == result.outputs.shape
+
+    def test_remove_tilt_none(self, path_test: pathlib.Path):
+        """With too few bright pixels in every row, nothing is shifted."""
+        result = soho.sumer.SpectrographObservation.from_level1(
+            path=path_test,
+            wavelength=_wavelength,
+            order=2,
+        )
+        assert result.remove_tilt(num_min=10_000) is result
 
     def test_show_still(self, path_test: pathlib.Path):
         result = soho.sumer.SpectrographObservation.from_level1(
