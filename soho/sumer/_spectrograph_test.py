@@ -15,6 +15,7 @@ import named_arrays as na
 from soho.sumer._spectrograph import _window, _extent, _vertices
 from soho.sumer._spectrograph import _centroid, _unit_radiance
 from soho.sumer._spectrograph import _shift_rows, _centroids_rows, _slope
+from soho.sumer._spectrograph import _fill_dead_columns
 
 _wavelength = 629.73 * u.AA
 """The wavelength of O V."""
@@ -388,6 +389,25 @@ def test_centroids_rows():
     assert np.all(np.isnan(none))
 
 
+def test_fill_dead_columns():
+    """
+    A column with no data in any pixel is filled between its neighbours.
+
+    Columns with data in some pixels, and dead columns at the ends,
+    are left as they are.
+    """
+    radiance = np.arange(4 * 3 * 8, dtype=float).reshape(4, 3, 8)
+    radiance[..., [0, 3, 4]] = np.nan
+    radiance[0, 0, 6] = np.nan
+    result = _fill_dead_columns(radiance)
+    assert np.allclose(result[..., 3], radiance[..., 2] + 1)
+    assert np.allclose(result[..., 4], radiance[..., 2] + 2)
+    assert np.all(np.isnan(result[..., 0]))
+    assert np.isnan(result[0, 0, 6])
+    assert np.array_equal(result[..., [1, 2, 5, 7]], radiance[..., [1, 2, 5, 7]])
+    assert np.all(np.isnan(_fill_dead_columns(np.full((2, 2, 3), np.nan))))
+
+
 def test_slope():
     """A straight line through points, with one far from it left out."""
     x = np.arange(20, dtype=float)
@@ -678,71 +698,171 @@ class TestSpectrographObservation:
             striped.remove_stripes(gain_max=1, gain_min=1)._radiance_aligned()
         )
 
-    def test_remove_tilt(self, path_test: pathlib.Path):
-        """A tilt put into the spectra is taken out, and the zero stays."""
+    @staticmethod
+    def _tilted(
+        path: pathlib.Path,
+    ) -> tuple[
+        soho.sumer.SpectrographObservation,
+        soho.sumer.SpectrographObservation,
+        np.ndarray,
+    ]:
+        """
+        The test observation, the same with a tilt of two columns, about
+        20 km/s, put in from one end of the slit to the other, and the
+        velocity of the middle of each column.
+        """
         result = soho.sumer.SpectrographObservation.from_level1(
-            path=path_test,
+            path=path,
             wavelength=_wavelength,
             order=2,
         ).trim_slit()
         radiance = result._radiance_aligned()
         rows = np.arange(radiance.shape[1], dtype=float)
-        # a tilt of two columns, about 20 km/s, from one end of the slit to
-        # the other
         tilt = 2 * (rows - rows.mean()) / (rows.size - 1)
         tilted = result._with_radiance(_shift_rows(radiance, tilt))
-
         edges = result.inputs.wavelength.ndarray_aligned((result.axis_wavelength,))
         middles = (edges[1:] + edges[:-1]) / 2
         velocity = middles.to_value(
             u.km / u.s,
             equivalencies=u.doppler_optical(_wavelength),
         )
+        return result, tilted, velocity
 
-        def centroids(observation: soho.sumer.SpectrographObservation) -> np.ndarray:
-            """The median centroid of each row, in km/s."""
-            return _centroids_rows(
-                radiance=observation._radiance_aligned(),
-                velocity=velocity,
-                velocity_band=40,
-                fraction_bright=0.2,
-                num_min=10,
-            )
+    @staticmethod
+    def _centroids(
+        observation: soho.sumer.SpectrographObservation,
+        velocity: np.ndarray,
+    ) -> np.ndarray:
+        """The median centroid of each row within 40 km/s, in km/s."""
+        return _centroids_rows(
+            radiance=_fill_dead_columns(observation._radiance_aligned()),
+            velocity=velocity,
+            velocity_band=40,
+            fraction_bright=0.2,
+            num_min=10,
+        )
 
-        def change(observation: soho.sumer.SpectrographObservation) -> float:
-            """The change of the centroid from one end of the slit to the other, km/s."""
-            centroid = centroids(observation)
-            finite = np.isfinite(centroid)
-            return _slope(rows[finite], centroid[finite]) * (rows.size - 1)
+    @classmethod
+    def _change(
+        cls,
+        observation: soho.sumer.SpectrographObservation,
+        velocity: np.ndarray,
+    ) -> float:
+        """The change of the centroid from one end of the slit to the other, km/s."""
+        centroid = cls._centroids(observation, velocity)
+        rows = np.arange(centroid.size, dtype=float)
+        finite = np.isfinite(centroid)
+        return _slope(rows[finite], centroid[finite]) * (rows.size - 1)
 
+    @staticmethod
+    def _zero(observation: soho.sumer.SpectrographObservation) -> u.Quantity:
+        """The centroid of the mean profile, which from_level1 puts at zero, km/s."""
+        wavelength = _centroid(
+            radiance=observation.outputs,
+            wavelengths=observation.inputs.wavelength,
+            wavelength=_wavelength,
+            axis_wavelength=observation.axis_wavelength,
+        )
+        return wavelength.to(u.km / u.s, equivalencies=u.doppler_optical(_wavelength))
+
+    def test_remove_tilt(self, path_test: pathlib.Path):
+        """A tilt put into the spectra is taken out, and the zero stays."""
+        result, tilted, velocity = self._tilted(path_test)
         # the band leaves out the wings of the line, so the tilt measures
         # much less than it is
-        assert abs(change(tilted) - change(result)) > 3
+        change = self._change(tilted, velocity) - self._change(result, velocity)
+        assert abs(change) > 3
         removed = tilted.remove_tilt()
-        assert abs(change(removed)) < 0.05
-        assert abs(np.nanmean(centroids(removed)) - np.nanmean(centroids(tilted))) < 0.5
+        assert abs(self._change(removed, velocity)) < 0.05
+        assert abs(self._zero(removed) - self._zero(tilted)) < 0.05 * u.km / u.s
         assert removed.inputs is tilted.inputs
         # all of the tilt put in is taken out, not only what the band measures
-        expected = centroids(result.remove_tilt())
-        difference = centroids(removed) - expected
+        expected = self._centroids(result.remove_tilt(), velocity)
+        difference = self._centroids(removed, velocity) - expected
         assert np.sqrt(np.nanmean(np.square(difference))) < 0.5
 
-    @pytest.mark.parametrize("response", ["vanishing", "flat"])
+    def test_remove_tilt_dead_column(self, path_test: pathlib.Path):
+        """A column with no data in the band does not stop the measurement."""
+        result, tilted, velocity = self._tilted(path_test)
+        radiance = tilted._radiance_aligned()
+        column = int(np.argmin(np.abs(velocity - 30)))
+        radiance[..., column] = np.nan
+        dead = tilted._with_radiance(radiance)
+        removed = dead.remove_tilt()
+        assert removed is not dead
+        # the same tilt is found as without the dead column, so the spectra
+        # agree away from it
+        expected = tilted.remove_tilt()._radiance_aligned()
+        away = np.abs(np.arange(velocity.size) - column) > 2
+        difference = removed._radiance_aligned()[..., away] - expected[..., away]
+        scale = np.nanmax(expected)
+        assert np.nanmedian(np.abs(difference)) < 1e-3 * scale
+        assert np.nanmax(np.abs(difference)) < 3e-2 * scale
+
+    def test_remove_tilt_tolerance(self, path_test: pathlib.Path):
+        """A tilt within the tolerance to begin with is left alone."""
+        result, tilted, velocity = self._tilted(path_test)
+        assert tilted.remove_tilt(tolerance=1000 * u.km / u.s) is tilted
+
+    def test_remove_tilt_no_line(self, path_test: pathlib.Path):
+        """A line far from zero velocity makes no peak in the band."""
+        result, tilted, velocity = self._tilted(path_test)
+        radiance = tilted._radiance_aligned()
+        away = np.full(radiance.shape[1], -12.0)
+        moved = tilted._with_radiance(_shift_rows(radiance, away))
+        assert moved.remove_tilt() is moved
+
+    @pytest.mark.parametrize("case", ["no column", "no data"])
+    def test_remove_tilt_nothing(self, path_test: pathlib.Path, case: str):
+        """With no column in the band, or no data, nothing is shifted."""
+        result, tilted, velocity = self._tilted(path_test)
+        if case == "no column":
+            assert tilted.remove_tilt(velocity_band=1e-6 * u.km / u.s) is tilted
+        else:
+            radiance = np.full_like(tilted._radiance_aligned(), np.nan)
+            empty = tilted._with_radiance(radiance)
+            assert empty.remove_tilt() is empty
+
+    @pytest.mark.parametrize("seed", [13, 20, 23, 27, 1])
+    def test_remove_tilt_noise(self, path_test: pathlib.Path, seed: int):
+        """Without a line in the band, the shift stays within its limit."""
+        result, tilted, velocity = self._tilted(path_test)
+        radiance = tilted._radiance_aligned()
+        rng = np.random.default_rng(seed)
+        noise = np.abs(1 + 0.3 * rng.standard_normal(radiance.shape))
+        noise = np.where(np.isfinite(radiance), noise, np.nan)
+        noisy = tilted._with_radiance(noise)
+        removed = noisy.remove_tilt()._radiance_aligned()
+        # a change of twice the band, 80 km/s, from one end of the slit to the
+        # other moves either end by less than four columns
+        lost = np.mean(np.isnan(removed)) - np.mean(np.isnan(noise))
+        assert lost < 4 / radiance.shape[~0]
+
+    @pytest.mark.parametrize(
+        argnames="slopes,same",
+        argvalues=[
+            # the centroids can no longer be measured once shifted
+            ([1, np.nan], True),
+            # the centroids do not respond to the shift
+            ([1, 1], True),
+            # the step goes beyond the largest tilt
+            ([100, 99], False),
+        ],
+    )
     def test_remove_tilt_stops(
         self,
         path_test: pathlib.Path,
         monkeypatch: pytest.MonkeyPatch,
-        response: str,
+        slopes: list[float],
+        same: bool,
     ):
         """
-        The search for the tilt stops if the centroids can no longer be
-        measured once the spectra are shifted, or stop changing.
+        The search for the tilt stops where it can go no further.
+
+        It then removes the tilt which measured least of those tried,
+        which may be none.
         """
-        result = soho.sumer.SpectrographObservation.from_level1(
-            path=path_test,
-            wavelength=_wavelength,
-            order=2,
-        ).trim_slit()
+        result, tilted, velocity = self._tilted(path_test)
         calls = []
 
         def centroids_rows(
@@ -752,18 +872,15 @@ class TestSpectrographObservation:
             fraction_bright: float,
             num_min: int,
         ) -> np.ndarray:
-            """A tilt of 1 km/s per row however the spectra are shifted,
-            which vanishes after the first measurement if asked to."""
-            calls.append(radiance.shape)
+            """Centroids with the next of the given tilts, in km/s per row."""
             rows = np.arange(radiance.shape[1], dtype=float)
-            if len(calls) > 1 and response == "vanishing":
-                return np.full_like(rows, np.nan)
-            return rows
+            calls.append(radiance.shape)
+            return slopes[len(calls) - 1] * rows
 
         monkeypatch.setattr(soho.sumer._spectrograph, "_centroids_rows", centroids_rows)
-        removed = result.remove_tilt()
+        removed = tilted.remove_tilt()
         assert len(calls) == 2
-        assert removed.outputs.shape == result.outputs.shape
+        assert (removed is tilted) == same
 
     def test_remove_tilt_none(self, path_test: pathlib.Path):
         """With too few bright pixels in every row, nothing is shifted."""
