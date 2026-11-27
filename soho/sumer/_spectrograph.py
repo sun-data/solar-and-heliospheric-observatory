@@ -102,9 +102,10 @@ centroid of the line is found, when the line is zeroed on its mean position.
 
 _response_min = 0.1
 """
-The least fraction of a tilt which the centroids within the band of
-:meth:`SpectrographObservation.remove_tilt` must measure for the search of the
-tilt to go on.
+The least fraction of a tilt or drift which the centroids within the band of
+:meth:`SpectrographObservation.remove_tilt` or
+:meth:`SpectrographObservation.remove_drift` must measure for the search of
+it to go on.
 
 The centroids of a line measure about a third of a tilt or more;
 those of a band with no line in it hardly respond.
@@ -112,9 +113,17 @@ those of a band with no line in it hardly respond.
 
 _response_max = 2
 """
-The largest fraction of a tilt which the centroids within the band of
-:meth:`SpectrographObservation.remove_tilt` may measure for the search of the
-tilt to go on.
+The largest fraction of a tilt or drift which the centroids within the band of
+:meth:`SpectrographObservation.remove_tilt` or
+:meth:`SpectrographObservation.remove_drift` may measure for the search of
+it to go on.
+"""
+
+_num_sinusoid = 5
+"""
+The least number of exposures whose centroids
+:meth:`SpectrographObservation.remove_drift` needs,
+one more than the straight line and the sinusoid it fits.
 """
 
 _unit_radiance = u.W / (u.sr * u.m**2 * u.AA)
@@ -682,6 +691,147 @@ def _slope(x: np.ndarray, y: np.ndarray) -> float:
     return float(coefficients[1])
 
 
+def _shift_exposures(radiance: np.ndarray, shift: np.ndarray) -> np.ndarray:
+    """
+    The spectra with each exposure shifted by some columns,
+    as :func:`_shift_rows` shifts each row of the slit.
+
+    Parameters
+    ----------
+    radiance
+        The radiances, along the exposures, the slit, and wavelength.
+    shift
+        For each exposure, how many columns toward the start of the
+        spectrum it moves.
+    """
+    shifted = _shift_rows(np.swapaxes(radiance, 0, 1), shift)
+    return np.swapaxes(shifted, 0, 1)
+
+
+def _centroids_exposures(
+    radiance: np.ndarray,
+    velocity: np.ndarray,
+    velocity_band: float,
+    fraction_bright: float,
+    num_min: int,
+) -> np.ndarray:
+    """
+    For each exposure, the median over its bright pixels of the centroid of
+    the line within `velocity_band` of zero velocity,
+    as :func:`_centroids_rows` finds it for each row of the slit.
+
+    Parameters
+    ----------
+    radiance
+        The radiances, along the exposures, the slit, and wavelength.
+    velocity
+        The Doppler velocity of the middle of each column.
+    velocity_band
+        The half width of the band, in the unit of `velocity`.
+    fraction_bright
+        The least radiance of a bright pixel over the band,
+        relative to the 95th percentile of those radiances.
+    num_min
+        The least number of bright pixels in an exposure for its median.
+    """
+    return _centroids_rows(
+        radiance=np.swapaxes(radiance, 0, 1),
+        velocity=velocity,
+        velocity_band=velocity_band,
+        fraction_bright=fraction_bright,
+        num_min=num_min,
+    )
+
+
+def _design_sinusoid(time: np.ndarray, period: float) -> np.ndarray:
+    """
+    The design matrix of a straight line plus a sinusoid of a period:
+    a column of ones, the times, and the cosine and sine of the period.
+
+    Parameters
+    ----------
+    time
+        The times.
+    period
+        The period, in the unit of `time`.
+    """
+    phase = 2 * np.pi * time / period
+    return np.stack([np.ones_like(time), time, np.cos(phase), np.sin(phase)], axis=~0)
+
+
+def _sinusoid_coefficients(
+    time: np.ndarray,
+    values: np.ndarray,
+    period: float,
+) -> np.ndarray:
+    """
+    The coefficients of the cosine and sine of a sinusoid of a period
+    which, with a straight line, is fitted to some points,
+    fitted again without the points more than four robust standard deviations
+    from it.
+
+    Parameters
+    ----------
+    time
+        The times of the points.
+    values
+        The values of the points.
+    period
+        The period, in the unit of `time`.
+    """
+    design = _design_sinusoid(time, period)
+    coefficients, *_ = np.linalg.lstsq(design, values, rcond=None)
+    residual = values - design @ coefficients
+    scatter = 1.4826 * np.median(np.abs(residual))
+    kept = np.abs(residual) <= 4 * scatter
+    if scatter > 0 and np.count_nonzero(kept) >= _num_sinusoid:
+        coefficients, *_ = np.linalg.lstsq(design[kept], values[kept], rcond=None)
+    return coefficients[2:]
+
+
+def _sinusoid(
+    time: np.ndarray,
+    values: np.ndarray,
+    periods: np.ndarray,
+) -> tuple[float, np.ndarray]:
+    """
+    The period, of several, of the sinusoid which, with a straight line,
+    fits some points best by least squares,
+    chosen again without the points more than four robust standard
+    deviations from the first fit,
+    and the coefficients of its cosine and sine,
+    as :func:`_sinusoid_coefficients` fits them.
+
+    Parameters
+    ----------
+    time
+        The times of the points.
+    values
+        The values of the points.
+    periods
+        The periods tried, in the unit of `time`.
+    """
+
+    def best(time: np.ndarray, values: np.ndarray) -> float:
+        """The period which fits some points best by least squares."""
+        costs = []
+        for period in periods:
+            design = _design_sinusoid(time, float(period))
+            coefficients, *_ = np.linalg.lstsq(design, values, rcond=None)
+            costs.append(float(np.sum(np.square(values - design @ coefficients))))
+        return float(periods[int(np.argmin(costs))])
+
+    period = best(time, values)
+    design = _design_sinusoid(time, period)
+    coefficients, *_ = np.linalg.lstsq(design, values, rcond=None)
+    residual = values - design @ coefficients
+    scatter = 1.4826 * np.median(np.abs(residual))
+    kept = np.abs(residual) <= 4 * scatter
+    if scatter > 0 and np.count_nonzero(kept) >= _num_sinusoid:
+        period = best(time[kept], values[kept])
+    return period, _sinusoid_coefficients(time, values, period)
+
+
 @dataclasses.dataclass(eq=False, repr=False)
 class SpectrographObservation(
     na.FunctionArray[
@@ -1188,6 +1338,70 @@ class SpectrographObservation(
         outputs = na.ScalarArray(radiance << _unit_radiance, axes=axes)
         return dataclasses.replace(self, outputs=outputs)
 
+    def _hours(self) -> np.ndarray:
+        """
+        The middle of each exposure, in hours from the middle of the first,
+        from the starts and the end of the exposures which
+        :meth:`from_level1` gives as the times.
+        """
+        time = typing.cast(na.ScalarArray, self.inputs.time)
+        vertices = astropy.time.Time(time.ndarray_aligned((self.axis_detector_x,)))
+        since = np.asarray((vertices - vertices[0]).to_value(u.hr), dtype=float)
+        middle = (since[1:] + since[:-1]) / 2
+        return middle - middle[0]
+
+    def _band(
+        self,
+        radiance: np.ndarray,
+        band: float,
+    ) -> None | tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        """
+        The spectra over which the line is measured within a band around zero
+        velocity, or :obj:`None` if no column is in the band,
+        or the mean profile has no peak inside it.
+
+        The spectra are cut to the band and as many columns on each side as a
+        shift of twice the band, and the columns with no data in any pixel,
+        the dead columns of the detector, are filled by interpolation.
+        They are returned with the velocity of the middle of each of their
+        columns, which of their columns are in the band,
+        and the change of the velocity from one column to the next.
+
+        Parameters
+        ----------
+        radiance
+            The radiances, along the exposures, the slit, and wavelength.
+        band
+            The half width of the band, in kilometers per second.
+        """
+        velocities = typing.cast(na.AbstractScalarArray, self.inputs.velocity)
+        middles = velocities.cell_centers(self.axis_wavelength)
+        middles = typing.cast(na.ScalarArray, middles)
+        middles = middles.ndarray_aligned((self.axis_wavelength,))
+        velocity = np.asarray(typing.cast(u.Quantity, middles).to_value(u.km / u.s))
+        step = float(np.mean(np.diff(velocity)))
+
+        inside = np.flatnonzero(np.abs(velocity) <= band)
+        if not inside.size:
+            return None
+        margin = int(np.ceil(2 * band / abs(step))) + 2
+        start = max(int(inside[0]) - margin, 0)
+        stop = min(int(inside[~0]) + margin + 1, velocity.size)
+        cube = _fill_dead_columns(radiance[..., start:stop])
+        velocity_cube = velocity[start:stop]
+        in_band = np.abs(velocity_cube) <= band
+
+        # the line has to make a peak of the mean profile inside the band
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            profile = np.nanmean(cube, axis=(0, 1))[in_band]
+        if not np.any(np.isfinite(profile)):
+            return None
+        peak = int(np.nanargmax(profile))
+        if peak == 0 or peak == profile.size - 1:
+            return None
+        return cube, velocity_cube, in_band, step
+
     def remove_bad_steps(
         self,
         ratio_max: float = 2,
@@ -1399,37 +1613,16 @@ class SpectrographObservation(
             measured as the spectra are.
         """
         radiance = self._radiance_aligned()
-        velocities = typing.cast(na.AbstractScalarArray, self.inputs.velocity)
-        middles = velocities.cell_centers(self.axis_wavelength)
-        middles = typing.cast(na.ScalarArray, middles)
-        middles = middles.ndarray_aligned((self.axis_wavelength,))
-        velocity = np.asarray(typing.cast(u.Quantity, middles).to_value(u.km / u.s))
-        step = float(np.mean(np.diff(velocity)))
         band = float(typing.cast(float, velocity_band.to_value(u.km / u.s)))
         change_min = float(typing.cast(float, tolerance.to_value(u.km / u.s)))
         rows = np.arange(radiance.shape[1], dtype=float)
 
         # The tilt is measured on the band alone, with as many columns on
         # each side as the largest shift the search can make.
-        inside = np.flatnonzero(np.abs(velocity) <= band)
-        if not inside.size:
+        measurement = self._band(radiance, band)
+        if measurement is None:
             return self
-        margin = int(np.ceil(2 * band / abs(step))) + 2
-        start = max(int(inside[0]) - margin, 0)
-        stop = min(int(inside[~0]) + margin + 1, velocity.size)
-        cube = _fill_dead_columns(radiance[..., start:stop])
-        velocity_cube = velocity[start:stop]
-        in_band = np.abs(velocity_cube) <= band
-
-        # the line has to make a peak of the mean profile inside the band
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            profile = np.nanmean(cube, axis=(0, 1))[in_band]
-        if not np.any(np.isfinite(profile)):
-            return self
-        peak = int(np.nanargmax(profile))
-        if peak == 0 or peak == profile.size - 1:
-            return self
+        cube, velocity_cube, in_band, step = measurement
 
         def centroids(shift: np.ndarray) -> np.ndarray:
             """The centroid of each row, with each row shifted by some columns."""
@@ -1492,6 +1685,200 @@ class SpectrographObservation(
             return self
         shift = best * (rows - middle) / step
         return self._with_radiance(_shift_rows(radiance, shift))
+
+    def remove_drift(
+        self,
+        period_min: u.Quantity = 1.75 * u.hr,
+        period_max: u.Quantity = 2.5 * u.hr,
+        num_period: int = 76,
+        span_min: u.Quantity = 4 * u.hr,
+        velocity_band: u.Quantity = 40 * u.km / u.s,
+        fraction_bright: float = 0.2,
+        num_min: int = 10,
+        tolerance: u.Quantity = 0.01 * u.km / u.s,
+        num_iteration: int = 10,
+    ) -> "SpectrographObservation":
+        """
+        Shift the spectrum of each exposure to remove a periodic drift of the
+        spectrum with time:
+        a shift of the line, the same all along the slit,
+        which rises and falls as a sinusoid of a period of about two hours.
+
+        The drift of SUMER changes with its temperature,
+        with a period of about two hours and about 0.7 of a column from peak
+        to valley, as the
+        `pages of the instrument <https://www2.mps.mpg.de/projects/soho/sumer/text/webluca/ch_inst.html>`_
+        at the Max Planck Institute for Solar System Research describe.
+        In the scans of the polar coronal holes of 1996 August and
+        September, eight hours each, the median shift of O V 629.7 angstroms
+        in each exposure rises and falls by 1.2 to 1.9 kilometers per second
+        on either side of a straight line, with periods of 2.0 to 2.25 hours,
+        and a single sinusoid of 2.1 hours keeps its phase from one scan to
+        the next over two days,
+        whichever corner of the Sun they point at,
+        which shows that the drift is instrumental.
+
+        The drift is measured from the line itself,
+        which has to lie within `velocity_band` of zero velocity,
+        as :meth:`from_level1` puts it by default.
+        In each exposure, the centroid of the line within `velocity_band` of
+        zero is found in each bright pixel,
+        and a straight line in time plus a sinusoid is fitted to the medians
+        of the exposures, for each of `num_period` periods from `period_min`
+        to `period_max`, keeping the period which fits best.
+        Each exposure is then shifted by the sinusoid alone,
+        less its mean weighted by the radiance of the exposures in the band,
+        so that the mean profile of the line,
+        whose centroid :meth:`from_level1` puts at zero, does not move;
+        the straight line, and any other change of the line with time or
+        along the raster, is kept.
+        As in :meth:`remove_tilt`, a centroid within a band measures as
+        little as a third of a shift,
+        so the drift removed is the sinusoid whose amplitude leaves none of it
+        in the centroids of the spectra once they are shifted by it,
+        found by the secant method, the radiances are shifted only once,
+        and the search steps only while the centroids respond to the
+        amplitude as those of a line do,
+        it goes no further than an amplitude of `velocity_band`,
+        and the amplitude removed is the one which measured least of those
+        tried.
+        Columns with no data in any pixel, the dead columns of the detector,
+        are filled by interpolation for the measurement only.
+
+        If the exposures whose centroids are measured span less than
+        `span_min`, too few periods to tell a sinusoid from a curve,
+        such as the change of the line toward the limb in a scan which leaves
+        the disk,
+        or the mean profile has no peak within the band,
+        or fewer than five exposures have enough bright pixels,
+        or the sinusoid measures less than `tolerance` to begin with,
+        the observation is returned as it is.
+
+        This assumes that the Sun itself has no such periodic shift of the
+        line, once it is averaged along the slit.
+
+        The radiance of each column is shared between the two columns it
+        overlaps once shifted, which keeps the total radiance of each
+        exposure but adds as much as a quarter of a column squared to the
+        variance of a line, and a column next to one with no data has no data
+        once shifted.
+        The drift removed is not recorded,
+        and the spectra of the exposures no longer lie where the wavelengths
+        of the files, plus :attr:`shift_wavelength`, put them.
+
+        Parameters
+        ----------
+        period_min
+            The shortest period of the sinusoid.
+        period_max
+            The longest period of the sinusoid.
+        num_period
+            The number of periods tried, evenly spaced from `period_min` to
+            `period_max`.
+        span_min
+            The least time from the first exposure whose centroid is measured
+            to the last.
+        velocity_band
+            The half width of the band around zero velocity
+            over which the centroid of the line is found.
+        fraction_bright
+            The least radiance of a bright pixel over the band,
+            relative to the 95th percentile of those radiances.
+        num_min
+            The least number of bright pixels in an exposure for its median.
+        tolerance
+            How small the amplitude of the sinusoid in the centroids has to be
+            once the drift is removed.
+        num_iteration
+            The most times the drift is measured again, after it is first
+            measured as the spectra are.
+        """
+        radiance = self._radiance_aligned()
+        band = float(typing.cast(float, velocity_band.to_value(u.km / u.s)))
+        change_min = float(typing.cast(float, tolerance.to_value(u.km / u.s)))
+        hours_min = float(typing.cast(float, span_min.to_value(u.hr)))
+        periods = np.linspace(
+            float(typing.cast(float, period_min.to_value(u.hr))),
+            float(typing.cast(float, period_max.to_value(u.hr))),
+            num_period,
+        )
+        hours = self._hours()
+
+        # The drift is measured on the band alone, with as many columns on
+        # each side as the largest shift the search can make.
+        measurement = self._band(radiance, band)
+        if measurement is None:
+            return self
+        cube, velocity_cube, in_band, step = measurement
+
+        def centroids(shift: np.ndarray) -> np.ndarray:
+            """The centroid of each exposure, with each shifted by some columns."""
+            return _centroids_exposures(
+                radiance=_shift_exposures(cube, shift),
+                velocity=velocity_cube,
+                velocity_band=band,
+                fraction_bright=fraction_bright,
+                num_min=num_min,
+            )
+
+        centroid = centroids(np.zeros_like(hours))
+        finite = np.isfinite(centroid)
+        if np.count_nonzero(finite) < _num_sinusoid:
+            return self
+        if np.ptp(hours[finite]) < hours_min:
+            return self
+        period, coefficients = _sinusoid(hours[finite], centroid[finite], periods)
+        amplitude_first = float(np.hypot(*coefficients))
+        if amplitude_first < change_min:
+            return self
+
+        # The sinusoid of unit amplitude, zero on average weighted by the
+        # radiance of the exposures in the band, which keeps the mean profile
+        # where it is.
+        direction = coefficients / amplitude_first
+        shape = _design_sinusoid(hours, period)[:, 2:] @ direction
+        weight = np.nansum(cube[..., in_band], axis=(1, 2))
+        shape = shape - np.sum(weight * shape) / np.sum(weight)
+
+        def measured(amplitude: float) -> float:
+            """
+            The amplitude of the sinusoid first measured in the centroids,
+            with the spectra shifted by a sinusoid of an amplitude.
+            """
+            centroid = centroids(amplitude * shape / step)
+            finite = np.isfinite(centroid)
+            if np.count_nonzero(finite) < _num_sinusoid:
+                return np.nan
+            fitted = _sinusoid_coefficients(hours[finite], centroid[finite], period)
+            return float(fitted @ direction)
+
+        amplitude_old = 0.0
+        measured_old = amplitude_first
+        tried = {amplitude_old: measured_old}
+        amplitude = float(np.clip(measured_old, -band, band))
+        for _ in range(num_iteration):
+            measured_new = measured(amplitude)
+            if not np.isfinite(measured_new):
+                break
+            tried[amplitude] = measured_new
+            if abs(measured_new) < change_min:
+                break
+            # the centroids of a line measure a fraction of the drift removed
+            response = -(measured_new - measured_old) / (amplitude - amplitude_old)
+            if not _response_min <= response <= _response_max:
+                break
+            amplitude_next = float(
+                np.clip(amplitude + measured_new / response, -band, band)
+            )
+            if amplitude_next == amplitude:
+                break
+            amplitude_old, measured_old = amplitude, measured_new
+            amplitude = amplitude_next
+
+        best = min(tried, key=lambda a: abs(tried[a]))
+        if best == 0:
+            return self
+        return self._with_radiance(_shift_exposures(radiance, best * shape / step))
 
     def show(
         self,

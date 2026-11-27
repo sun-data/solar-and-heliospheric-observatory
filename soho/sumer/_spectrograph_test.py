@@ -16,6 +16,8 @@ from soho.sumer._spectrograph import _window, _extent, _vertices
 from soho.sumer._spectrograph import _centroid, _unit_radiance
 from soho.sumer._spectrograph import _shift_rows, _centroids_rows, _slope
 from soho.sumer._spectrograph import _fill_dead_columns
+from soho.sumer._spectrograph import _shift_exposures, _centroids_exposures
+from soho.sumer._spectrograph import _sinusoid, _sinusoid_coefficients
 
 _wavelength = 629.73 * u.AA
 """The wavelength of O V."""
@@ -415,6 +417,53 @@ def test_slope():
     y[7] = 100
     assert np.isclose(_slope(x, y), 0.5)
     assert np.isclose(_slope(x[:2], y[:2]), 0.5)
+
+
+@pytest.mark.parametrize("shift", [0, 0.3, -1.5])
+def test_shift_exposures(shift: float):
+    """An exposure moves toward the start of the spectrum, and keeps its radiance."""
+    radiance = _lines(np.array([0.0, 1.0]), num_exposure=2)
+    result = _shift_exposures(radiance, np.array([shift, 0]))
+    assert np.allclose(_columns(result)[0], -shift + np.array([0, 1]))
+    assert np.allclose(np.nansum(result, axis=~0), np.nansum(radiance, axis=~0))
+    assert np.array_equal(result[1], radiance[1])
+
+
+def test_centroids_exposures():
+    """The median centroid of the bright pixels of each exposure."""
+    step = 10
+    rows = _lines(np.array([0, 0.5, -1, 0.2]), num_exposure=12)
+    radiance = np.swapaxes(rows, 0, 1).copy()
+    velocity = step * (np.arange(radiance.shape[~0]) - radiance.shape[~0] // 2)
+    # a faint exposure has too few bright pixels for its median
+    radiance[3, :9] = np.nan
+    result = _centroids_exposures(
+        radiance=radiance,
+        velocity=velocity,
+        velocity_band=100,
+        fraction_bright=0.2,
+        num_min=5,
+    )
+    assert np.allclose(result[:3], step * np.array([0, 0.5, -1]), atol=0.01)
+    assert np.isnan(result[3])
+
+
+def test_sinusoid():
+    """
+    The period and the sinusoid which, with a straight line, fit some points,
+    with one far from them left out.
+    """
+    time = np.linspace(0, 8, 200)
+    phase = 2 * np.pi * time / 2.1
+    values = 0.3 * time - 1 + 1.5 * np.cos(phase) - 0.5 * np.sin(phase)
+    values[17] = 100
+    periods = np.linspace(1.75, 2.5, 76)
+    period, coefficients = _sinusoid(time, values, periods)
+    assert np.isclose(period, 2.1)
+    assert np.allclose(coefficients, [1.5, -0.5])
+    # too few points to leave any out
+    few = _sinusoid_coefficients(time[:5], values[:5], 2.1)
+    assert np.allclose(few, [1.5, -0.5])
 
 
 class TestSpectrographObservation:
@@ -890,6 +939,202 @@ class TestSpectrographObservation:
             order=2,
         )
         assert result.remove_tilt(num_min=10_000) is result
+
+    def test_hours(self, path_test: pathlib.Path):
+        """The middle of each exposure, in hours from the middle of the first."""
+        result = soho.sumer.SpectrographObservation.from_level1(
+            path=path_test,
+            wavelength=_wavelength,
+            order=2,
+        )
+        hours = result._hours()
+        assert hours.shape == (result.outputs.shape[result.axis_detector_x],)
+        assert hours[0] == 0
+        assert np.all(np.diff(hours) > 0)
+        # the 76 exposures of the pass take about 22 minutes
+        assert 0.3 < hours[~0] < 0.4
+
+    @staticmethod
+    def _drifted(
+        path: pathlib.Path,
+    ) -> tuple[
+        soho.sumer.SpectrographObservation,
+        soho.sumer.SpectrographObservation,
+        np.ndarray,
+    ]:
+        """
+        The test observation with its exposures spread over six hours,
+        the same with a drift of half a column, about 5 km/s, put in as a
+        sinusoid of two hours, and the velocity of the middle of each column.
+        """
+        result = soho.sumer.SpectrographObservation.from_level1(
+            path=path,
+            wavelength=_wavelength,
+            order=2,
+        ).trim_slit()
+        axis_x = result.axis_detector_x
+        time = result.inputs.time
+        num = time.shape[axis_x]
+        vertices = time.ndarray[0] + np.linspace(0, 6, num) * u.hr
+        time = na.ScalarArray(vertices, axes=axis_x)
+        result = dataclasses.replace(
+            result,
+            inputs=dataclasses.replace(result.inputs, time=time),
+        )
+        drift = 0.5 * np.sin(2 * np.pi * result._hours() / 2 + 0.3)
+        radiance = _shift_exposures(result._radiance_aligned(), drift)
+        drifted = result._with_radiance(radiance)
+        edges = result.inputs.wavelength.ndarray_aligned((result.axis_wavelength,))
+        middles = (edges[1:] + edges[:-1]) / 2
+        velocity = middles.to_value(
+            u.km / u.s,
+            equivalencies=u.doppler_optical(_wavelength),
+        )
+        return result, drifted, velocity
+
+    @staticmethod
+    def _centroids_drift(
+        observation: soho.sumer.SpectrographObservation,
+        velocity: np.ndarray,
+    ) -> np.ndarray:
+        """The median centroid of each exposure within 40 km/s, in km/s."""
+        return _centroids_exposures(
+            radiance=_fill_dead_columns(observation._radiance_aligned()),
+            velocity=velocity,
+            velocity_band=40,
+            fraction_bright=0.2,
+            num_min=10,
+        )
+
+    @classmethod
+    def _amplitude(
+        cls,
+        observation: soho.sumer.SpectrographObservation,
+        velocity: np.ndarray,
+    ) -> float:
+        """The amplitude of a sinusoid of two hours in the centroids, in km/s."""
+        centroid = cls._centroids_drift(observation, velocity)
+        hours = observation._hours()
+        finite = np.isfinite(centroid)
+        coefficients = _sinusoid_coefficients(hours[finite], centroid[finite], 2)
+        return float(np.hypot(*coefficients))
+
+    def test_remove_drift(self, path_test: pathlib.Path):
+        """A drift put into the spectra is taken out, and the zero stays."""
+        result, drifted, velocity = self._drifted(path_test)
+        # the band leaves out the wings of the line, so the drift measures
+        # less than it is
+        assert self._amplitude(drifted, velocity) > 1
+        removed = drifted.remove_drift()
+        assert self._amplitude(removed, velocity) < 0.05
+        assert abs(self._zero(removed) - self._zero(drifted)) < 0.05 * u.km / u.s
+        assert removed.inputs is drifted.inputs
+        # all of the drift put in is taken out, not only what the band measures
+        expected = self._centroids_drift(result, velocity)
+        difference = self._centroids_drift(removed, velocity) - expected
+        assert np.sqrt(np.nanmean(np.square(difference))) < 0.5
+
+    def test_remove_drift_short(self, path_test: pathlib.Path):
+        """Exposures which span less than `span_min` are left alone."""
+        result = soho.sumer.SpectrographObservation.from_level1(
+            path=path_test,
+            wavelength=_wavelength,
+            order=2,
+        )
+        assert result.remove_drift() is result
+
+    def test_remove_drift_tolerance(self, path_test: pathlib.Path):
+        """A drift within the tolerance to begin with is left alone."""
+        result, drifted, velocity = self._drifted(path_test)
+        assert drifted.remove_drift(tolerance=1000 * u.km / u.s) is drifted
+
+    def test_remove_drift_no_line(self, path_test: pathlib.Path):
+        """A line far from zero velocity makes no peak in the band."""
+        result, drifted, velocity = self._drifted(path_test)
+        radiance = drifted._radiance_aligned()
+        away = np.full(radiance.shape[0], -12.0)
+        moved = drifted._with_radiance(_shift_exposures(radiance, away))
+        assert moved.remove_drift() is moved
+
+    @pytest.mark.parametrize("case", ["no column", "no data"])
+    def test_remove_drift_nothing(self, path_test: pathlib.Path, case: str):
+        """With no column in the band, or no data, nothing is shifted."""
+        result, drifted, velocity = self._drifted(path_test)
+        if case == "no column":
+            assert drifted.remove_drift(velocity_band=1e-6 * u.km / u.s) is drifted
+        else:
+            radiance = np.full_like(drifted._radiance_aligned(), np.nan)
+            empty = drifted._with_radiance(radiance)
+            assert empty.remove_drift() is empty
+
+    def test_remove_drift_none(self, path_test: pathlib.Path):
+        """With too few bright pixels in every exposure, nothing is shifted."""
+        result, drifted, velocity = self._drifted(path_test)
+        assert drifted.remove_drift(num_min=10_000) is drifted
+
+    @pytest.mark.parametrize("seed", [13, 20, 23])
+    def test_remove_drift_noise(self, path_test: pathlib.Path, seed: int):
+        """Without a line in the band, the shift stays within its limit."""
+        result, drifted, velocity = self._drifted(path_test)
+        radiance = drifted._radiance_aligned()
+        rng = np.random.default_rng(seed)
+        noise = np.abs(1 + 0.3 * rng.standard_normal(radiance.shape))
+        noise = np.where(np.isfinite(radiance), noise, np.nan)
+        noisy = drifted._with_radiance(noise)
+        removed = noisy.remove_drift()._radiance_aligned()
+        # an amplitude of the band, 40 km/s, moves an exposure by no more than
+        # twice the band, less than nine columns
+        lost = np.mean(np.isnan(removed)) - np.mean(np.isnan(noise))
+        assert lost < 9 / radiance.shape[~0]
+
+    @pytest.mark.parametrize(
+        argnames="amplitudes,same",
+        argvalues=[
+            # the centroids can no longer be measured once shifted
+            ([1, np.nan], True),
+            # the centroids do not respond to the shift
+            ([1, 1], True),
+            # the step goes beyond the largest amplitude
+            ([100, 90], False),
+        ],
+    )
+    def test_remove_drift_stops(
+        self,
+        path_test: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        amplitudes: list[float],
+        same: bool,
+    ):
+        """
+        The search for the drift stops where it can go no further.
+
+        It then removes the drift which measured least of those tried,
+        which may be none.
+        """
+        result, drifted, velocity = self._drifted(path_test)
+        hours = drifted._hours()
+        calls = []
+
+        def centroids_exposures(
+            radiance: np.ndarray,
+            velocity: np.ndarray,
+            velocity_band: float,
+            fraction_bright: float,
+            num_min: int,
+        ) -> np.ndarray:
+            """Centroids with the next of the given amplitudes, in km/s."""
+            calls.append(radiance.shape)
+            amplitude = amplitudes[len(calls) - 1]
+            return amplitude * np.sin(2 * np.pi * hours / 2 + 0.3)
+
+        monkeypatch.setattr(
+            soho.sumer._spectrograph,
+            "_centroids_exposures",
+            centroids_exposures,
+        )
+        removed = drifted.remove_drift()
+        assert len(calls) == 2
+        assert (removed is drifted) == same
 
     def test_show_still(self, path_test: pathlib.Path):
         result = soho.sumer.SpectrographObservation.from_level1(
